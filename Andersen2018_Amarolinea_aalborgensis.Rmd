@@ -1,0 +1,294 @@
+---
+title: "Genomic insights into Candidatus Amarolinea aalborgensis gen. nov., sp. nov., associated with settleability problems in wastewater treatment plants"
+author: "Martin H. Andersen et al. 2018"
+date: "`r format(Sys.time(), '%d-%m-%Y')`, Aalborg, Denmark"
+output: html_document
+---
+
+# Introduction
+This report documents the binning of an Amarolinea genome from a full scale activated sludge aerated tank at Aalborg West wastewater treatment plant. See [Andersen et al. 2018: "TITLE"](<LinkToJournal>) for further details.
+
+Raw sequencing data is available in the European Nucleotide Archive with the project ID [PRJEB27012](<linktoenaproject).
+
+
+# Load R libraries and data
+The binning is performed using the [mmgenome2 package](https://kasperskytte.github.io/mmgenome2/).
+```{r, warning=FALSE, message=F}
+library(mmgenome2)
+library(data.table)
+library(dplyr)
+library(Biostrings)
+library(tidyverse)
+```
+
+## Load data
+The three samples sequenced on Illumina were from an aeration tank at Aalborg West wwtp, sampled at three different collection dates - 2013 (9/10-2013), 2014 (5/2-2014) and 2015 (MiDAS 2nd period 2015, 4/5). The 2014 sample (y14) is, based on V1-3 amplicon data, believed to be in highest abundance, 2013 (y13) in medium abundance and 2015 (y15) in very low abundance. The assembly was made using metaSPAdes on Illumina data, where only the 2014 sample was used for the assembly.
+```{r message=FALSE, warning=FALSE}
+assembly_combined <- "data/combined/assembly.fasta"
+
+essential <- read.delim("data/combined/essential.txt", header = T, sep=" ")[,c(1,3)]
+tax <- read.delim("data/combined/tax.txt", header = T, sep = "\t")
+
+# 16S, process SINA export
+rRNA16S <- read.delim("data/combined/arb-silva.de_align_resultlist_517396.csv", header=T, sep=";")
+scaffold <- rep(0,times =dim(rRNA16S)[1] )
+for (i in 1:dim(rRNA16S)[1]) {
+ scaffold[i]<-unlist(strsplit(x = as.character(rRNA16S$sequence_identifier[i]),split = "[.]"))[1]
+}
+ssu_tax <- cbind(scaffold,rRNA16S)[,c(1,22)]
+```
+
+## Load links between scaffolds
+The paired-end links were made using the custom perl script "network.pl" on all samples combined, including Nanopore data.
+```{r message=FALSE, warning=FALSE}
+links <- read.delim("data/combined/network.txt", header = T, sep = "\t")
+```
+
+
+## Load data into mmgenome
+The data is combined into a data frame, d. The two 2014 samples sequenced on Illumina are combined below. The two MinION dataset are already combined.
+```{r, warning=F, message=F}
+d <- mmload(
+    assembly = assembly_combined,
+    coverage = "data/combined/",
+    essential_genes = essential,
+    taxonomy = tax,
+    additional = ssu_tax,
+    verbose = TRUE
+  )
+
+
+colnames(d)[4:8] <- c("cov_y14_nano", "cov_y13", "cov_y14", "cov_y15", "cov_y14_2nd")
+
+d$cov_y14 <- d$cov_y14 + d$cov_y14_2nd
+d <- d[,-8]
+```
+
+
+Clean environment - remove redundant variables.
+```{r message=FALSE, warning=FALSE}
+rm(essential, tax, i, assembly_combined, scaffold, rRNA16S)
+```
+
+
+## Session info
+Print session info for reproducibility.
+```{r}
+sessionInfo()
+```
+
+
+# Analysing the metagenome
+
+## Stats of all data
+Show number of scaffolds, N50, max scaffold length, mean GC content, coverage numbers, number of essential genes found etc.
+```{r}
+mmstats(d)
+```
+
+
+## Initial bin selection
+Coverage plot of Illumina and Nanopore data from the same timepoint. The Chloroflexi bin selected is shown inside the dotted lines.
+```{r, fig.width=12, fig.height=10, fig.align='center'}
+s1 <- data.frame(cov_y14 = c(44.185, 46.228, 71.252, 97.77, 78.498),
+           cov_y14_nano = c(13.805, 9.413, 7.239, 22.342, 38.193))
+
+mmplot(d, 
+       x = "cov_y14", 
+       y = "cov_y14_nano",
+       color_by = "phylum",
+       x_scale = "log10",
+       y_scale = "log10",
+       locator = F,
+       min_length = 3000,
+       x_limits = c(5, 500),
+       y_limits = c(1, 500), 
+       selection = s1)
+#p1$plot + theme(axis.title = element_text(size = 14),
+        #axis.text = element_text(size = 12)) + labs(colour="Phylum")
+```
+
+
+The bin of interest from the plot of above is extracted and saved to a new object.
+```{r}
+d1 <- mmextract(d, s1)
+```
+
+Basic stats of the extracted bins
+```{r}
+mmstats(d1)
+```
+
+
+There is 109 essential genes in the bin, where 104 are unique. It seems to be a good bin, but could be cleaned up further. Using a pairs plot it is easier to get an overview of which variables are useful for further subsetting.
+```{r, fig.width=12, fig.height=10, fig.align='center'}
+mmplot_pairs(mm = d1,
+             variables = c("cov_y13", "cov_y14", "cov_y15", "cov_y14_nano", "gc"), color_by = "phylum")
+```
+
+
+## Further polishing of bin
+Using cov_y13 and cov_y15 it seems that high-abundance scaffolds can be filtered out. 
+```{r, fig.width=12, fig.height=10, fig.align='center'}
+s2 <- data.frame(cov_y13 = c(9.109, 9.476, 13.88, 19.303, 23.625, 20.241, 11.515),
+           cov_y15 = c(0.217, 0.666, 2.397, 2.594, 0.34, 0.048, 0.037))
+
+mmplot(d1, 
+       x = "cov_y13", 
+       y = "cov_y15",
+       color_by = "phylum",
+       y_scale = "log10",
+       locator = F,
+       selection = s2)
+```
+
+
+The selected bin is extracted again.
+```{r}
+d2 <- mmextract(d1, s2)
+```
+
+Stats of the new extraction
+```{r}
+mmstats(d2)
+```
+
+55 scaffolds have been filtered, without filtering any containing essential genes.
+
+## Use paired-end information to expand selection
+Now that scaffolds have been filtered away it is time to use the paired-end information to pull back scaffolds, which are connected to the bin. First a visualization of connected scaffolds is plotted. Here only scaffolds with minimum 5 connections are shown.
+```{r, fig.width=12, fig.height=10, fig.align='center'}
+mmnetwork(mm = d2, 
+          network = links, 
+          min_connections = 5, 
+          color_by = "phylum")
+```
+
+
+The scaffolds are then retrieved and saved in a new object
+```{r}
+d3 <- mmexpand_network(mm = d, 
+                       scaffolds = d2, 
+                       network = links, 
+                       min_connections = 5)
+```
+
+
+Finally show what has been recovered, where the original scaffolds are highlighted in red outline.
+```{r, fig.width=12, fig.height=10, fig.align='center'}
+mmnetwork(mm = d3, 
+          network = links, 
+          min_connections = 1, 
+          color_by = "phylum", 
+          highlight_labels = d2)
+```
+
+
+As the retrieval of scaffolds has most likely added some contamination, a new coverage plot is produced to visualize the extraction (note: high-copy repeats omitted). The original scaffolds are highlighted in red outline.
+```{r, fig.width=12, fig.height=10, fig.align='center'}
+mmplot(d3, 
+       x = "cov_y14", 
+       y = "cov_y14_nano",
+       x_scale = "log10",
+       y_scale = "log10",
+       #x_limits = c(1, 100),
+       #y_limits = c(1, 30),
+       color_by = "phylum",
+       locator = F,
+       highlight_scaffolds = d2)
+```
+
+
+## Export the selected bin
+There is no clear contamination in the coverage plot. The stats of the selection will indicate if extra essential genes have been added.
+```{r}
+mmstats(d3)
+```
+
+
+Another indicator could be if multiple 16S rRNA genes are contained in the genome bin. This is checked using the SILVA taxonomy added during the assembly workflow.
+```{r}
+subset(d3, !is.na(lca_tax_slv))$lca_tax_slv %>% as.character()
+```
+
+
+The genome bin looks relatively clean and is exported as is. 
+```{r}
+mmexport(d3, 
+         assembly, 
+         file = "combined_results/ama_all.fa")
+```
+
+
+# Analysing the reassembled bin
+
+## Import data
+```{r, warning=F, message=F}
+reassembly <- Biostrings::readDNAStringSet("data/reassembled/U+ama_all+porechop_out4k+MQ180409-418_S418_L001_assembly.fa", format = "fasta")
+
+# Rename scaffolds
+scaffold_names <- strsplit(names(reassembly), " ")
+scaffold_names <- unlist(map(scaffold_names, 1))
+names(reassembly) <- scaffold_names
+
+d_re <- mmload(
+    assembly = reassembly,
+    coverage = "data/reassembled/",
+    #essential_genes = essential,
+    #taxonomy = tax,
+    #additional = ssu_tax,
+    verbose = TRUE
+  )
+
+
+colnames(d_re)[4:5] <- c("cov_y14_ill", "cov_y14_nano")
+```
+
+# Stats of all data
+```{r}
+mmstats(d_re)
+
+d_re1 <- subset(d_re, length > 1000)
+
+mmstats(d_re1)
+```
+
+# Overview
+```{r}
+mmplot(d_re1, 
+       x = "cov_y14_ill", 
+       y = "cov_y14_nano",
+       x_limits = c(0, 100),
+       y_limits = c(0, 100),
+       locator = F
+       )
+```
+
+# Bin 1 - remove small contigs of low coverage
+```{r}
+s1_high <- data.frame(cov_y14_ill = c(36.476, 37.525, 300, 300),
+           cov_y14_nano = c(500, 6.923, 9.892, 500))
+
+
+mmplot(d_re1, 
+       x = "cov_y14_ill", 
+       y = "cov_y14_nano",
+       color_by = "phylum",
+       x_scale = "log10", 
+       y_scale = "log10",
+       locator = F,
+       x_limits = c(5, 300),
+       y_limits = c(1, 500), 
+       selection = s1_high)
+```
+
+Extract bin
+```{r}
+d_high <- mmextract(d_re1, s1_high)
+
+mmstats(d_high)
+
+mmexport(d_high,
+         assembly,
+         file = "reassembly/reassembled_w_high.fa")
+```
