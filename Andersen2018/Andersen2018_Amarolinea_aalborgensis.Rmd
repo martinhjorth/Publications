@@ -221,6 +221,8 @@ mmexport(d3,
 
 
 # Analysing the reassembled bin
+After reassembling the exported bin with Illumina and Nanopore data. Coverage files were generated using the *calc.coverage.in.bam.depth.pl* script.
+
 
 ## Import data
 ```{r, warning=F, message=F}
@@ -244,7 +246,8 @@ d_re <- mmload(
 colnames(d_re)[4:5] <- c("cov_y14_ill", "cov_y14_nano")
 ```
 
-# Stats of all data
+
+## Stats of all data
 ```{r}
 mmstats(d_re)
 
@@ -253,7 +256,8 @@ d_re1 <- subset(d_re, length > 1000)
 mmstats(d_re1)
 ```
 
-# Overview
+
+## Overview of coverage
 ```{r}
 mmplot(d_re1, 
        x = "cov_y14_ill", 
@@ -264,7 +268,8 @@ mmplot(d_re1,
        )
 ```
 
-# Bin 1 - remove small contigs of low coverage
+
+## Bin 1 - remove small contigs of low coverage
 ```{r}
 s1_high <- data.frame(cov_y14_ill = c(36.476, 37.525, 300, 300),
            cov_y14_nano = c(500, 6.923, 9.892, 500))
@@ -282,7 +287,8 @@ mmplot(d_re1,
        selection = s1_high)
 ```
 
-Extract bin
+
+Extract and export the final bin
 ```{r}
 d_high <- mmextract(d_re1, s1_high)
 
