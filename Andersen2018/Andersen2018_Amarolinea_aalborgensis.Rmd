@@ -6,9 +6,9 @@ output: html_document
 ---
 
 # Introduction
-This report documents the binning of an Amarolinea genome from a full scale activated sludge aerated tank at Aalborg West wastewater treatment plant. See [Andersen et al. 2018: "TITLE"](<LinkToJournal>) for further details.
+This report documents the binning of an Amarolinea genome from a full scale activated sludge aerated tank at Aalborg West wastewater treatment plant. See [Andersen et al. 2018](https://www.sciencedirect.com/science/article/pii/S0723202018302352/pdf?md5=819d032e142af6d90742cc41a2f25b48&pid=1-s2.0-S0723202018302352-main.pdf) for further details.
 
-Raw sequencing data is available in the European Nucleotide Archive with the project ID [PRJEB27012](<linktoenaproject).
+Raw sequencing data is available in the European Nucleotide Archive with the project ID [PRJEB27012](https://www.ebi.ac.uk/ena/data/search?query=PRJEB27012).
 
 
 # Load R libraries and data
