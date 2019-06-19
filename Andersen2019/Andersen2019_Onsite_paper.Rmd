@@ -1,0 +1,2227 @@
+---
+title: "<Paper title>"
+author: "Martin H. Andersen et al. XXXX"
+date: "`r format(Sys.time(), '%d-%m-%Y')`, Aalborg, Denmark"
+output: 
+  html_document: 
+    fig_caption: true
+header-includes:
+- \usepackage{caption}
+editor_options: 
+  chunk_output_type: console
+---
+
+# Introduction
+This report documents the analysis of 16S rRNA gene amplicon sequencing data produced on MinION (Oxford Nanopore Technologies) and MiSeq (Illumina). The analysis concerns data produced both onsite a full-scale wastewater treatment plant and in the laboratory at Aalborg Univsersity. As such, the analyses in the report concerns an onsite data analysis and a chapter on comparisons. See [Andersen et al. XXXX](<Link to manuscript>) for further details.
+
+Raw sequencing data is available in the European Nucleotide Archive with the project ID [<ProjectID>](<link to archive>).
+
+#### Load R libraries and set options
+Install packages
+```{r install_libs, eval=F}
+install.packages("Rcpp")
+install.packages("htmltools")
+install.packages("stringi")
+install.packages("readr")
+install.packages("tidyselect")
+install.packages("lazyeval")
+install.packages("later")
+install.packages("promises")
+install.packages("covr", dependencies = T)
+install.packages("scales")
+install.packages("dplyr", dependencies = T)
+install.packages("reshape2", dependencies = T)
+install.packages("gridExtra")
+install.packages("tidyr")
+install.packages("haven")
+install.packages("cellranger")
+install.packages("readxl")
+install.packages("tidyverse", dependencies = T)
+install.packages("ggthemes")
+install.packages("knitr")
+install.packages("kableExtra")
+install.packages("curl")
+install.packages("ape")
+install.packages("ggrepel")
+install.packages("vegan")
+install.packages("remotes")
+remotes::install_github("MadsAlbertsen/ampvis2")
+source("http://www.bioconductor.org/biocLite.R")
+biocLite(c("Biostrings"))
+```
+
+Amplicon analysis is performed using the [ampvis2 package](https://github.com/MadsAlbertsen/ampvis2).
+```{r load_libs, warning=FALSE, message=F, echo=T}
+library(data.table)
+library(dplyr)
+library(reshape2)
+library(gridExtra)
+library(tidyverse)
+library(scales)
+library(ggthemes)
+library(knitr)
+library(kableExtra)
+library(ampvis2)
+library(Biostrings)
+```
+\pagebreak
+
+```{r set-options, echo = FALSE, cache = FALSE}
+options(width = 600)
+```
+
+
+# Impact of Nanopore errors
+
+### Initial steps
+Firstly, extract sequences from the Clostridiales order, which will be used as a small control database. The ESVs are identified in the MiDAS 3.1 database
+```{bash, eval=F}
+grep 'Clostridiales.*' map_db_test/midas3/singleline_ESV.fa > map_db_test/Clostridiales_order.list
+```
+
+And extracted to a fasta file
+```{bash, eval=F}
+cat Clostridiales_order.list | \
+  tr -d '>' | \
+  seqtk subseq /space/users/mha/Desktop/Onsite_paper/map_db_test/midas3/singleline_ESV.fa - > map_db_test/Clostridiales_order.fa
+```
+
+Cluster, align and create tree. The sequences are often very similar, so to remove some of the diversity the data are clustered to 99.5%
+```{bash, eval=F}
+vsearch --cluster_fast map_db_test/Clostridiales_order.fa --id 0.995 --centroids map_db_test/Clostridiales_order_995clust.fa
+```
+
+Create alignment of clustered sequences
+```{bash, eval=F}
+mafft --thread 10 map_db_test/Clostridiales_order_995clust.fa > map_db_test/clostridiales_clust_align.aln
+```
+
+Fix taxonomy in alignment, as the MiDAS 3.1 taxonomy will not work in the tree
+```{bash, eval=F}
+sed 's,;,+,g' map_db_test/clostridiales_clust_align.aln > map_db_test/clostridiales_clust_align_fix.aln
+sed 's,\,,_,g' -i map_db_test/clostridiales_clust_align_fix.aln
+sed 's,tax=d:,,g' -i map_db_test/clostridiales_clust_align_fix.aln
+sed 's,p:,,g' -i map_db_test/clostridiales_clust_align_fix.aln
+sed 's/.://g' -i map_db_test/clostridiales_clust_align_fix.aln
+```
+
+Make a tree from the alignment
+```{bash, eval=F}
+fasttreeMP -nt map_db_test/clostridiales_clust_align_fix.aln > map_db_test/clostridiales_clust995_tree.newick
+```
+
+### Map real sequence and simulated reads to increasingly "amputated"" databases
+Choose one ESV and extract sequence
+```{bash, eval=F}
+grep -A1 'ESV13758' /space/users/mha/Desktop/Onsite_paper/map_db_test/midas3/singleline_ESV_notax.fa > map_db_test/clostridiales_esv.fa
+```
+
+The chosen ESV (ESV13758 with tax Bacteria,p:Firmicutes,c:Clostridia,o:Clostridiales,f:Lachnospiraceae,g:Blautia,s:Blautia_wexlerae) is used for the following analyses. Nanopore errors were introduced using [DeepSimulator](https://github.com/lykaust15/DeepSimulator) on a virtual machine, using default settings with '-n 10000' appended to produce 10000 simulated reads. The resulting fast5 files were basecalled using Guppy 2.3.5 with the flipflop configuration. The simulated reads are mapped to the real sequence to identify which reads were generated successfully (>85% identity)
+```{bash, eval=F}
+map_db_test/minimap2/minimap2 -ax map-ont -t 20 map_db_test/clostridiales_esv.fa seqdata/nanopore/2019-04-24_clostridiales-10kreads-deepsim-gup235/2019-04-24_clost-deepsim-gup235.fastq > map_db_test/mappings/2019-04-24_clost-deepsim10k-gup235-vs-real.sam
+```
+
+Calculate mapping identity and remove redundant information
+```{bash, eval=F}
+sed '/^@/ d' map_db_test/mappings/2019-04-24_clost-deepsim10k-gup235-vs-real.sam | \
+awk -F "\t" '$2 ==0' | \
+awk '{
+    for(i=1;i<=NF;i++){
+      if($i ~ /^NM:i:/){sub("NM:i:", "", $i); mm = $i}
+    }
+    split($6, count, /[^0-9]+/);
+    split($6, type, /[^A-Z]*/);
+    for(i=1; i<= length(count)-1; i++){
+      if(type[i + 1] ~ /[DIM]/){aln+=count[i]};
+    }
+    print $1, (aln - mm)/aln, $12, $14, $20
+    aln=0;
+  }' > map_db_test/mappings/2019-04-24_clost-deepsim10k-gup235-vs-real.txt
+```
+
+Check the alignments in R, subset 1000 random rows and output the readIDs. Set seed to 42 for reproducibility
+```{r message=FALSE, warning=FALSE}
+deepsim10k_aln <- fread("map_db_test/mappings/2019-04-24_clost-deepsim10k-gup235-vs-real.txt")
+set.seed(42)
+deepsim1k_sub <- sample_n(deepsim10k_aln, 1000) %>% select(V1) %>% unlist()
+#write.table(deepsim1k_sub, file = "map_db_test/clostridiales-deepsim1k-gup235-readsIDs", quote = FALSE, row.names=F, col.names = F)
+```
+
+Subsample from original readset - after testing the 1000 subsampled reads, it turned out only 997 could map to the reference. Therefore 1200 reads are randomly subsampled instead and 1000 alignments subsampled after mapping.
+```{bash, eval=F}
+#seqtk subseq seqdata/nanopore/2019-04-24_clostridiales-10kreads-deepsim-gup235/2019-04-24_clost-deepsim-gup235.fastq map_db_test/clostridiales-deepsim1k-gup235-readsIDs > seqdata/nanopore/2019-04-24_clostridiales-10kreads-deepsim-gup235/2019-04-24_clost-deepsim-gup235-1ksub.fq
+seqtk sample -s42 seqdata/nanopore/2019-04-24_clostridiales-10kreads-deepsim-gup235/2019-04-24_clost-deepsim-gup235.fastq 1200 > seqdata/nanopore/2019-04-24_clostridiales-10kreads-deepsim-gup235/2019-04-24_clost-deepsim-gup235-1200sub.fq
+```
+
+Remove taxonomic levels
+```{bash, eval=F}
+# Species
+sed '/s:Blautia_wexlerae/,+1d' db/midas31/MiDAS-31-single.fa > db/midas31-mod/blautia-midas31-species-filt.fa
+# Genus
+sed '/g:Blautia/,+1d' db/midas31/MiDAS-31-single.fa > db/midas31-mod/blautia-midas31-genus-filt.fa
+# Family
+sed '/f:Lachnospiraceae/,+1d' db/midas31/MiDAS-31-single.fa > db/midas31-mod/blautia-midas31-family-filt.fa
+# Order
+sed '/o:Clostridiales/,+1d' db/midas31/MiDAS-31-single.fa > db/midas31-mod/blautia-midas31-order-filt.fa
+# Class
+sed '/c:Clostridia/,+1d' db/midas31/MiDAS-31-single.fa > db/midas31-mod/blautia-midas31-class-filt.fa
+# Phylum
+sed '/p:Firmicutes/,+1d' db/midas31/MiDAS-31-single.fa > db/midas31-mod/blautia-midas31-phylum-filt.fa
+# Domain
+sed '/d:Bacteria/,+1d' db/midas31/MiDAS-31-single.fa > db/midas31-mod/blautia-midas31-domain-filt.fa
+```
+
+The 1000 subsampled simulated reads, along with the real sequence, are first mapped to the full MiDAS 3.1 database, then the species (Blautia_wexlerae) is removed and the reads are mapped again. This continues for all taxonomic levels.
+```{bash, eval=F}
+#sh minimap_combined_paf.sh
+sh minimap_combined_sam.sh
+```
+
+### Effect of removing taxonomic groups
+Load all mapping data into R, keep only primary mappings
+```{r message=FALSE, warning=FALSE}
+# Define function
+# mapping_minipaf <- function(x) {
+#   df <- x %>% 
+#     setNames(c("Query", "Qlen", "Tax", "reflen", "matchnum", "MapID", "alnscore", "alntype", "minimap2ID")) %>% 
+#     separate(Tax, c("RefESV", "Tax"), ";tax=") %>%
+#     mutate(Tax= gsub("[a-z]:", "", Tax), Tax=gsub(";","",Tax), alnscore=as.integer(gsub(".*:", "", alnscore)), MapID = MapID*100, minimap2ID = 100-as.numeric(gsub("de:f:", "", minimap2ID))*100, Qcov = matchnum/Qlen*100, alntype = gsub(".*:", "", alntype)) %>% 
+#     separate(Tax, c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species"), ",") %>% 
+#     subset(alntype = "tp:A:P") %>% 
+#     select(-c(minimap2ID, alntype))
+#   return(df)
+# }
+mapping_minisam <- function(x) {
+  df <- x %>% 
+    setNames(c("Query", "SAMflag", "Tax", "Qlen", "alnlen", "MapID", "NMscore", "alnscore", "minimap2ID")) %>% 
+     separate(Tax, c("RefESV", "Tax"), ";tax=") %>%
+     mutate(Tax= gsub("[a-z]:", "", Tax), Tax=gsub(";","",Tax), alnscore=as.integer(gsub(".*:", "", alnscore)), MapID = MapID*100, minimap2ID = 100-as.numeric(gsub("de:f:", "", minimap2ID))*100, Rlen = gsub(".*\\.", "", RefESV))
+  df$Qr <- as.numeric(df$Qlen)/as.numeric(df$alnlen)
+  #if(nrow(df)>1000){
+  #  df <- sample_n(df, 1000)
+  #}else{}
+  return(df)
+}
+
+# Reference
+esv13758_ref_real <- fread("map_db_test/mappings/clost_real_minimap_vs_midas31_ref.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Illumina", Taxlevel = "Reference")
+
+#esv13758_ref_deepsim <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas3_ref.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Reference")
+esv13758_ref_deepsim_alba <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas31_ref-alba231.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Reference")
+#esv13758_ref_deepsim_wick <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas31_ref-alba231_rwick.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Reference")
+
+# Species removed
+esv13758_species_real <- fread("map_db_test/mappings/clost_real_minimap_vs_midas31_filt_species.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Illumina", Taxlevel = "Species")
+
+#esv13758_species_deepsim <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas3_filt_species.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Species")
+esv13758_species_deepsim <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas31_filt_species-alba231.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Species")
+#esv13758_species_deepsim_wick <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas31_filt_species-alba231_rwick.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Species")
+
+# Genus removed
+esv13758_genus_real <- fread("map_db_test/mappings/clost_real_minimap_vs_midas31_filt_genus.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Illumina", Taxlevel = "Genus")
+
+#esv13758_genus_deepsim <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas3_filt_genus.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Genus")
+esv13758_genus_deepsim <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas31_filt_genus-alba231.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Genus")
+#esv13758_genus_deepsim_wick <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas31_filt_genus-alba231_rwick.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Genus")
+
+# Family removed
+esv13758_family_real <- fread("map_db_test/mappings/clost_real_minimap_vs_midas31_filt_family.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Illumina", Taxlevel = "Family")
+
+#esv13758_family_deepsim <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas3_filt_family.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Family")
+esv13758_family_deepsim <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas31_filt_family-alba231.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Family")
+#esv13758_family_deepsim_wick <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas31_filt_family-alba231_rwick.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Family")
+
+# Order removed
+esv13758_order_real <- fread("map_db_test/mappings/clost_real_minimap_vs_midas31_filt_order.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Illumina", Taxlevel = "Order")
+
+#esv13758_order_deepsim <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas3_filt_order.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Order")
+esv13758_order_deepsim <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas31_filt_order-alba231.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Order")
+#esv13758_order_deepsim_wick <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas31_filt_order-alba231_rwick.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Order")
+
+# Class removed
+esv13758_class_real <- fread("map_db_test/mappings/clost_real_minimap_vs_midas31_filt_class.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Illumina", Taxlevel = "Class")
+
+#esv13758_class_deepsim <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas3_filt_class.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Class")
+esv13758_class_deepsim <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas31_filt_class-alba231.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Class")
+#esv13758_class_deepsim_wick <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas31_filt_class-alba231_rwick.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Class")
+
+# Phylum removed
+esv13758_phylum_real <- fread("map_db_test/mappings/clost_real_minimap_vs_midas31_filt_phylum.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Illumina", Taxlevel = "Phylum")
+
+#esv13758_phylum_deepsim <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas3_filt_phylum.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Phylum")
+esv13758_phylum_deepsim <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas31_filt_phylum-alba231.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Phylum")
+#esv13758_phylum_deepsim_wick <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas31_filt_phylum-alba231_rwick.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Phylum")
+
+# Domain removed
+# Nothing could map to another domain
+#esv13758_domain_real <- fread("map_db_test/mappings/clost_real_minimap_vs_midas3_filt_domain.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Illumina", Taxlevel = "Domain")
+
+#esv13758_domain_deepsim <- fread("map_db_test/mappings/clost_deepsim_minimap_vs_midas3_filt_domain.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Domain")
+
+# Create data frame and remove the redundant variables
+esv13758_df_alba <- mget(ls(pattern = "^(esv13758_.*_real|esv13758_.*_deepsim)")) %>% bind_rows
+#esv13758_df_wick <- mget(ls(pattern = "^(esv13758_.*_real|esv13758_.*_deepsim_wick)")) %>% bind_rows
+
+rm(list = ls(pattern = "^(esv13758_.*_real|esv13758_.*_deepsim.*)"))
+
+
+esv13758_df_alba$Taxlevel <- factor(esv13758_df_alba$Taxlevel, levels = c("Reference","Species", "Genus", "Family", "Order", "Class", "Phylum"))
+#esv13758_df_wick$Taxlevel <- factor(esv13758_df_wick$Taxlevel, levels = c("Reference","Species", "Genus", "Family", "Order", "Class", "Phylum"))
+
+# Quality filter, only keep queries with a lenght of > 1000 and that cover > 80% of the reference sequence
+#esv13758_df_sub <- esv13758_df %>% subset(Qlen > 1000 & Qcov > 80)
+#esv13758_df_sub <- esv13758_df %>% subset(Qlen > 1000 & Qcov > 80)
+#d_clust_s <- subset(d_clust, Qlen > 430 & Qlen < 510 & alnlen > 420 & alnlen < 520 & Qr > 0.9 & Qr < 1.1)
+```
+
+QC: Distribution of reference length/alignment length ratios for the different taxonomy levels
+```{r message=FALSE, warning=FALSE}
+library(ggridges)
+ggplot(esv13758_df_alba, aes(x = Qr, y = Taxlevel, fill = Platform)) + geom_density_ridges2() + theme_bw() + scale_x_continuous(limits = c(0,10))
+```
+
+Wick QC: Distribution of reference length/alignment length ratios for the different taxonomy levels
+```{r message=FALSE, warning=FALSE}
+ggplot(esv13758_df_wick, aes(x = Qr, y = Taxlevel, fill = Platform)) + geom_density_ridges2() + theme_bw() + scale_x_continuous(limits = c(0,10))
+```
+
+QC: Distribution of query lengths and alignment lengths for the different taxonomy levels
+```{r message=FALSE, warning=FALSE}
+esvdf <- esv13758_df_alba %>% select(c(Platform, Taxlevel, Qlen, alnlen))%>% melt()
+ggplot(esvdf, aes(x = value, y = Taxlevel, fill=variable), alpha=0.25) + geom_density_ridges2(alpha=0.5) + geom_vline(xintercept = 1452, colour = "red", linetype = "longdash")+ theme_bw()# + scale_x_continuous(limits = c(0,10))
+```
+
+Wick QC: Distribution of query lengths and alignment lengths for the different taxonomy levels
+```{r message=FALSE, warning=FALSE}
+esvdf_wick <- esv13758_df_wick %>% select(c(Platform, Taxlevel, Qlen, alnlen))%>% melt()
+ggplot(esvdf_wick, aes(x = value, y = Taxlevel, fill=variable), alpha=0.25) + geom_density_ridges2(alpha=0.5) + geom_vline(xintercept = 1452, colour = "red", linetype = "longdash")+ theme_bw()# + scale_x_continuous(limits = c(0,10))
+```
+
+QC: Mapping identity vs alignment length
+```{r message=FALSE, warning=FALSE}
+ggplot(subset(esv13758_df_alba, Platform == "Nanopore"), aes(x = minimap2ID, y = alnlen, color=Taxlevel)) + geom_point() + geom_hline(yintercept = 1452, colour = "red", linetype = "longdash") + theme_bw()# + scale_x_continuous(limits = c(0,10))
+```
+
+Wick QC: Mapping identity vs alignment length
+```{r message=FALSE, warning=FALSE}
+ggplot(subset(esv13758_df_wick, Platform == "Nanopore"), aes(x = minimap2ID, y = alnlen, color=Taxlevel)) + geom_point() + geom_hline(yintercept = 1452, colour = "red", linetype = "longdash") + theme_bw()# + scale_x_continuous(limits = c(0,10))
+```
+
+Subset to alignment lengths > 1200bp and query/alignment ratios in the 0.9-1.1 range (removes 40% of the data) and then randomly subset to 1000 alignments (removes 30% more, i.e. 38% of the original data are left)
+```{r message=FALSE, warning=FALSE}
+esv13758_df_sub <- esv13758_df_alba %>% subset(Qlen > 1200 & Qr< 1.1 & Qr > 0.9)
+
+platforms <- levels(as.factor(esv13758_df_sub$Platform))
+
+esvsub_output <- data.frame(Query = character(), SAMflag = integer(), RefESV = character(), Tax = character(), Qlen = integer(), alnlen = integer(), MapID = numeric(), NMscore = integer(), alnscore = integer(), minimap2ID = numeric(), Rlen = integer(), Qr = numeric(), Platform = character(), Taxlevel = character())
+
+for (i in seq_along(platforms)) {
+  dframe <- subset(esv13758_df_sub, esv13758_df_sub$Platform == platforms[i])
+  taxlevs <- levels(as.factor(dframe$Taxlevel))
+  for (o in seq_along(taxlevs)){
+    newdf <- subset(dframe, dframe$Taxlevel == taxlevs[o])# %>% as.data.frame()
+    if(nrow(newdf)>1000){
+      loopdf <- sample_n(newdf, 1000)
+    }else{
+      loopdf <- newdf
+    }
+    esvsub_output <- rbind(esvsub_output, loopdf)
+  }
+}
+
+esv13758_df_sub_wick <- esv13758_df_wick %>% subset(Qlen > 1200 & Qr< 1.1 & Qr > 0.9)
+```
+
+QC: Mapping identity vs alignment length - sub
+```{r message=FALSE, warning=FALSE}
+ggplot(subset(esv13758_df_sub, Platform == "Nanopore"), aes(x = minimap2ID, y = alnlen, color=Taxlevel)) + geom_point() + geom_hline(yintercept = 1452, colour = "red", linetype = "longdash") + theme_bw()# + scale_x_continuous(limits = c(0,10))
+```
+
+Wick QC: Mapping identity vs alignment length - sub
+```{r message=FALSE, warning=FALSE}
+ggplot(subset(esv13758_df_sub_wick, Platform == "Nanopore"), aes(x = minimap2ID, y = alnlen, color=Taxlevel)) + geom_point() + geom_hline(yintercept = 1452, colour = "red", linetype = "longdash") + theme_bw()# + scale_x_continuous(limits = c(0,10))
+```
+
+Boxplot of mapping identities (full dataset)
+```{r, message=FALSE, warning=FALSE}
+stat_box_data <- function(y, upper_limit = max(esv13758_df_alba$minimap2ID) * 1.12) {
+  return(
+    data.frame(
+      y=0.95 * upper_limit,
+      label = paste0('c=', length(y), '\n',
+                    'm=', round(mean(y), 1), '\n')
+    )
+  )
+}
+
+ggplot(esv13758_df_alba, aes(x=Taxlevel, y = minimap2ID, fill = Platform)) + 
+  geom_boxplot() + 
+  stat_summary(
+    fun.data = stat_box_data,
+    geom = "text",
+    hjust = 0.5,
+    vjust = 0.9,
+    size = 3,
+    position = position_dodge(width = 0.75)
+  ) +
+  coord_cartesian(ylim = c(40, 105)) + ylab("Mapping identity [%]") + xlab("") + labs(fill = "Data set") + #scale_fill_manual(values = c("#E69F00", "#56B4E9", "#0571B0", "#CA0020")) + 
+  theme_bw() + theme(panel.grid.major.x = element_blank()) + scale_y_continuous(breaks = c(40, 50, 60, 70, 80, 90, 95, 97.5, 100)) #+ ggsave("map_db_test/plots/map_mock-SMK_mapID.png", width = 17, height = 6.5, dpi = 300)
+```
+
+Wick Boxplot of mapping identities (full dataset)
+```{r, message=FALSE, warning=FALSE}
+stat_box_data <- function(y, upper_limit = max(esv13758_df_wick$minimap2ID) * 1.12) {
+  return(
+    data.frame(
+      y=0.95 * upper_limit,
+      label = paste0('c=', length(y), '\n',
+                    'm=', round(mean(y), 1), '\n')
+    )
+  )
+}
+
+ggplot(esv13758_df_wick, aes(x=Taxlevel, y = minimap2ID, fill = Platform)) + 
+  geom_boxplot() + 
+  stat_summary(
+    fun.data = stat_box_data,
+    geom = "text",
+    hjust = 0.5,
+    vjust = 0.9,
+    size = 3,
+    position = position_dodge(width = 0.75)
+  ) +
+  coord_cartesian(ylim = c(40, 105)) + ylab("Mapping identity [%]") + xlab("") + labs(fill = "Data set") + #scale_fill_manual(values = c("#E69F00", "#56B4E9", "#0571B0", "#CA0020")) + 
+  theme_bw() + theme(panel.grid.major.x = element_blank()) + scale_y_continuous(breaks = c(40, 50, 60, 70, 80, 90, 95, 97.5, 100)) #+ ggsave("map_db_test/plots/map_mock-SMK_mapID.png", width = 17, height = 6.5, dpi = 300)
+```
+
+Boxplot of mapping identities (quality-filtered subset)
+```{r, message=FALSE, warning=FALSE}
+stat_box_data <- function(y, upper_limit = max(esvsub_output$minimap2ID) * 1.12) {
+  return(
+    data.frame(
+      y=0.95 * upper_limit,
+      label = paste0('c=', length(y), '\n',
+                    'm=', round(mean(y), 1), '\n')
+    )
+  )
+}
+
+ggplot(esvsub_output, aes(x=Taxlevel, y = minimap2ID, fill = Platform)) + 
+  geom_boxplot() + 
+  stat_summary(
+    fun.data = stat_box_data,
+    geom = "text",
+    hjust = 0.5,
+    vjust = 0.9,
+    size = 3,
+    position = position_dodge(width = 0.75)
+  ) +
+  coord_cartesian(ylim = c(40, 105)) + ylab("Mapping identity [%]") + xlab("") + labs(fill = "Data set") + #scale_fill_manual(values = c("#E69F00", "#56B4E9", "#0571B0", "#CA0020")) + 
+  theme_bw() + theme(panel.grid.major.x = element_blank()) + scale_y_continuous(breaks = c(40, 50, 60, 70, 80, 90, 95, 97.5, 100)) #+ ggsave("map_db_test/plots/map_mock-SMK_mapID.png", width = 17, height = 6.5, dpi = 300)
+```
+
+How many of the Nanopore reads map to the right reference?
+```{r, message=FALSE, warning=FALSE}
+np_ref_maps <- esvsub_output %>% subset(Platform == "Nanopore" & Taxlevel == "Reference")
+levels(as.factor(np_ref_maps$Tax))
+# And how many to the right genus (i.d. species removed)
+np_species_maps <- esvsub_output %>% subset(Platform == "Nanopore" & Taxlevel == "Species")
+levels(as.factor(np_species_maps$Tax))
+# And to the right family (i.d. genus removed)
+np_genus_maps <- esvsub_output %>% subset(Platform == "Nanopore" & Taxlevel == "Genus")
+levels(as.factor(np_genus_maps$Tax))
+# And to the right order (i.d. family removed)
+np_family_maps <- esvsub_output %>% subset(Platform == "Nanopore" & Taxlevel == "Family")
+levels(as.factor(np_family_maps$Tax)) # Hits different families
+# And to the right class (i.d. order removed)
+np_order_maps <- esvsub_output %>% subset(Platform == "Nanopore" & Taxlevel == "Order")
+levels(as.factor(np_order_maps$Tax)) # Hits different orders
+```
+
+
+Wick Boxplot of mapping identities (quality-filtered subset)
+```{r, message=FALSE, warning=FALSE}
+stat_box_data <- function(y, upper_limit = max(esv13758_df_sub_wick$minimap2ID) * 1.12) {
+  return(
+    data.frame(
+      y=0.95 * upper_limit,
+      label = paste0('c=', length(y), '\n',
+                    'm=', round(mean(y), 1), '\n')
+    )
+  )
+}
+
+ggplot(esv13758_df_sub_wick, aes(x=Taxlevel, y = minimap2ID, fill = Platform)) + 
+  geom_boxplot() + 
+  stat_summary(
+    fun.data = stat_box_data,
+    geom = "text",
+    hjust = 0.5,
+    vjust = 0.9,
+    size = 3,
+    position = position_dodge(width = 0.75)
+  ) +
+  coord_cartesian(ylim = c(40, 105)) + ylab("Mapping identity [%]") + xlab("") + labs(fill = "Data set") + #scale_fill_manual(values = c("#E69F00", "#56B4E9", "#0571B0", "#CA0020")) + 
+  theme_bw() + theme(panel.grid.major.x = element_blank()) + scale_y_continuous(breaks = c(40, 50, 60, 70, 80, 90, 95, 97.5, 100)) #+ ggsave("map_db_test/plots/map_mock-SMK_mapID.png", width = 17, height = 6.5, dpi = 300)
+```
+
+Boxplot of alignment scores (full dataset)
+```{r, message=FALSE, warning=FALSE}
+stat_box_data2 <- function(y, upper_limit = max(esv13758_df_alba$alnscore) * 1.12) {
+  return(
+    data.frame(
+      y=0.95 * upper_limit,
+      label = paste0('c=', length(y), '\n',
+                    'm=', round(mean(y), 1), '\n')
+    )
+  )
+}
+ggplot(esv13758_df_alba, aes(x=Taxlevel, y = alnscore, fill = Platform)) + 
+  geom_boxplot() + 
+   stat_summary(
+    fun.data = stat_box_data2,
+    geom = "text",
+    hjust = 0.5,
+    vjust = 0.9,
+    size = 3,
+    position = position_dodge(width = 0.75)
+  ) + #scale_fill_manual(values = c("#E69F00", "#56B4E9", "#0571B0", "#CA0020")) +
+    labs(fill = "Data set") + 
+  theme_bw() + theme(panel.grid.major.x = element_blank()) #+ ggsave("map_db_test/plots/map_mock-SMK_alnscore.png", width = 17, height = 6.5, dpi = 300)
+```
+
+Boxplot of alignment scores (quality-filtered subset)
+```{r, message=FALSE, warning=FALSE}
+stat_box_data2 <- function(y, upper_limit = max(esv13758_df_sub$alnscore) * 1.12) {
+  return(
+    data.frame(
+      y=0.95 * upper_limit,
+      label = paste0('c=', length(y), '\n',
+                    'm=', round(mean(y), 1), '\n')
+    )
+  )
+}
+ggplot(esv13758_df_sub, aes(x=Taxlevel, y = alnscore, fill = Platform)) + 
+  geom_boxplot() + 
+   stat_summary(
+    fun.data = stat_box_data2,
+    geom = "text",
+    hjust = 0.5,
+    vjust = 0.9,
+    size = 3,
+    position = position_dodge(width = 0.75)
+  ) + #scale_fill_manual(values = c("#E69F00", "#56B4E9", "#0571B0", "#CA0020")) +
+    labs(fill = "Data set") + 
+  theme_bw() + theme(panel.grid.major.x = element_blank()) #+ ggsave("map_db_test/plots/map_mock-SMK_alnscore.png", width = 17, height = 6.5, dpi = 300)
+```
+
+#### TEST - create phylogenetic tree of the sequences that are mapped to
+
+Write out reference ESVs, in order to create a database and a phylogenetic tree
+```{r, message=FALSE, warning=FALSE, eval=F}
+nperror_Resv <- levels(as.factor(esv13758_df_sub$RefESV))
+#write.table(nperror_Resv, file = "map_db_test/ESVs_in_clost_mappings", quote = FALSE, row.names=F, col.names = F)
+```
+
+Subset ESVs, align and create tree
+```{bash, eval = F}
+seqtk subseq /space/users/mha/Desktop/Onsite_paper/map_db_test/midas3/singleline_ESV_notax.fa map_db_test/ESVs_in_clost_mappings > map_db_test/clostridiales_mapping_ESVs.fa
+mafft --thread 30 map_db_test/clostridiales_mapping_ESVs.fa > map_db_test/clostridiales_mapping_ESVs.aln
+fasttreeMP -nt map_db_test/clostridiales_mapping_ESVs.aln > map_db_test/clostridiales_mappings_tree.newick
+```
+
+Tree visualised in FigTree v. 1.4.4. A clade containing the real ESV and 80 other ESVs was selected, exported and regex'ed to get the ESV numbers of the clade. These are now used to figure out which taxonomic levels the ESVs represent
+```{r, message=FALSE, warning=FALSE, eval=F}
+clost_clade <- fread("map_db_test/clostridiales_mappings_tree_cladeESVs", header = F) %>% unlist()
+midas3_tax_clost <- fread("map_db_test/midas3/tax_complete.csv", header = T, sep = ",") %>% subset(ESV %in% clost_clade)
+levels(as.factor(midas3_tax_clost$Order))
+levels(as.factor(midas3_tax_clost$Family))
+```
+
+
+# Comparison of databases
+
+Find Illumina samples, quality filter and merge reads.
+```{bash, eval=F}
+sh seqdata/illumina/get_samples.sh
+```
+
+Unique sequences from the sequencing data are extracted prior to clustering
+```{bash, eval=F}
+usearch10 -fastx_uniques seqdata/illumina/il_midasSTD.fastq -fastaout map_db_test/uniques.fasta -sizeout -relabel Uniq -minuniquesize 2 -threads 20
+```
+
+Cluster unique sequences into zOTUs/ASVs. zOTUs are created by clustering the unique sequences (sequencing errors are corrected, chimeras are removed)
+```{bash, eval=F}
+usearch10 -unoise3 map_db_test/uniques.fasta -zotus map_db_test/zotus.fa -tabbedout map_db_test/unoise3_log.txt -threads 20
+```
+
+Fix ZOTU bug. Usearch has a bug and won't work if ZOTUs are named ZOTUs - rename to ASVs
+```{bash, eval=F}
+sed -i 's/Zotu/ASV/g' map_db_test/zotus.fa
+```
+
+The ZOTUs are used to create a zOTUtable by mapping the quality-trimmed sequencing data back to the zOTUs
+```{bash, eval=F}
+usearch10 -otutab seqdata/illumina/il_midasSTD.fastq -zotus map_db_test/zotus.fa -otutabout map_db_test/zotutab.txt -mapout map_db_test/zmap.txt -threads 20
+```
+
+Map zOTUs to SILVA 132 and MiDAS 3.1
+```{bash, eval=F}
+# SILVA r132
+usearch10 -usearch_global map_db_test/zotus.fa -db /space/databases/SILVA/SILVA_132_SSURef_tax_silva.fasta -strand plus -id 0.5 -maxaccepts 0 -maxrejects 0 -samout map_db_test/mappings/zotus_usearch_silva132.sam -threads 20
+# MiDAS 3.1
+usearch10 -usearch_global map_db_test/zotus.fa -db db/midas31/MiDAS-31-single.fa -strand plus -id 0.5 -maxaccepts 0 -maxrejects 0 -samout map_db_test/mappings/zotus_usearch_midas3.sam -threads 20
+```
+
+Remove secondary and split mappings
+```{bash, eval=F}
+awk '$2 == 0' map_db_test/mappings/zotus_usearch_silva132.sam > map_db_test/mappings/zotus_usearch_silva132_filt.sam
+awk '$2 == 0' map_db_test/mappings/zotus_usearch_midas3.sam > map_db_test/mappings/zotus_usearch_midas3_filt.sam
+```
+
+Calculate mapping errors
+```{bash, eval=F}
+### // USEARCH10 //
+awk '{
+    for(i=1;i<=NF;i++){
+      if($i ~ /^NM:i:/){sub("NM:i:", "", $i); mm = $i}
+    }
+    split($6, count, /[^0-9]+/);
+    split($6, type, /[^A-Z]*/);
+    for(i=1; i<= length(count)-1; i++){
+      if(type[i + 1] ~ /[DIM]/){aln+=count[i]};
+    }
+    print $1, $2, $3, (aln - mm)/aln, $12
+    aln=0;
+  }' map_db_test/mappings/zotus_usearch_midas3_filt.sam > map_db_test/zotus_usearch_midas3_filt.txt
+  
+awk -F '\t' -v OFS='\t' '{
+    for(i=1;i<=NF;i++){
+      if($i ~ /^NM:i:/){sub("NM:i:", "", $i); mm = $i}
+    }
+    split($6, count, /[^0-9]+/);
+    split($6, type, /[^A-Z]*/);
+    for(i=1; i<= length(count)-1; i++){
+      if(type[i + 1] ~ /[DIM]/){aln+=count[i]};
+    }
+    print $1, $2, $3, (aln - mm)/aln, $12
+    aln=0;
+  }' map_db_test/mappings/zotus_usearch_silva132_filt.sam > map_db_test/zotus_usearch_silva132_filt.txt
+```
+
+Load mapping data into R
+```{r, warning=F, message=FALSE}
+z_map_silva <- fread("map_db_test/zotus_usearch_silva132_filt.txt", sep = '\t') %>% setNames(., c("Query", "SAMflag", "Reference", "MapID", "alnscore"))
+z_map_midas <- fread("map_db_test/zotus_usearch_midas3_filt.txt", sep = " ") %>% setNames(., c("Query", "SAMflag", "Reference", "MapID", "alnscore")) %>% mutate(Reference = gsub(';.*', '', Reference))
+z_map_silva$db <- "SILVA132"
+z_map_midas$db <- "MiDAS3.1"
+z_mappings <- rbind(z_map_silva, z_map_midas)
+```
+
+Load zOTUtable into R and find most abundant zOTUs
+```{r}
+zotus <- fread("map_db_test/zotutab.txt", header = T) %>% arrange(desc(M00878)) %>% setNames(., c("ASV", "abund"))
+ztop100 <- head(zotus, 100) %>% ungroup() %>% select(ASV) %>% unlist()
+ztop1000 <- head(zotus, 1000) %>% ungroup() %>% select(ASV) %>% unlist()
+```
+29 zOTUs were observed only once - filter? 2822 zOTUs were created in the analysis. When mapping data to the zOTUs to produce a zOTUtable, only 2803 zOTUs were aligned.
+Mapping the constructed zOTUs to SILVA returned 2822 primary mappings, while mapping to MiDAS 3.1 also returned 2822 primary mappings.
+
+Make dataframe for each
+```{r, warning=F, message=FALSE}
+midas_top100 <- subset(z_mappings, db == "MiDAS3.1" & Query %in% ztop100) %>% select(Query, Reference, MapID, db) %>% mutate(set="Top100")
+midas_top1000 <- subset(z_mappings, db == "MiDAS3.1" & Query %in% ztop1000) %>% select(Query, Reference, MapID, db) %>% mutate(set="Top1000")
+midas_all <- subset(z_mappings, db == "MiDAS3.1") %>% select(Query, Reference, MapID, db) %>% mutate(set="All (2822)")
+
+silva_top100 <- subset(z_mappings, db == "SILVA132" & Query %in% ztop100) %>% select(Query, Reference, MapID, db) %>% mutate(set="Top100")
+silva_top1000 <- subset(z_mappings, db == "SILVA132" & Query %in% ztop1000) %>% select(Query, Reference, MapID, db) %>% mutate(set="Top1000")
+silva_all <- subset(z_mappings, db == "SILVA132") %>% select(Query, Reference, MapID, db) %>% mutate(set="All (2822)")
+
+all <- rbind(midas_top100, midas_top1000, midas_all, silva_top100, silva_top1000, silva_all)
+```
+
+Group hits based on mapping identities
+```{r, warning=F, message=FALSE}
+hit <- ifelse(all$MapID == 1, "100", ifelse((all$MapID > 0.987) & (all$MapID < 1), "98.7", ifelse((all$MapID > 0.945) & (all$MapID <= 0.987), "94.5", "bad")))
+all$hit <- hit
+
+all_sum <- all %>% group_by(db, set, hit) %>% summarise(n_hit = n())
+
+output <- data.frame(DB=character(), Set=character(), treshold=character(), count=integer(), freq=numeric())
+dbs <- levels(as.factor(all_sum$db))
+for (i in seq_along(dbs)) {
+  dframe <- subset(all_sum, all_sum$db == dbs[i])
+  setvec <- levels(as.factor(dframe$set))
+  for (o in seq_along(setvec)) {
+    newdf <- subset(dframe, dframe$set == setvec[o]) %>% as.data.frame()
+    rownames(newdf) <- newdf$hit
+    perfect <- newdf["100", "n_hit"]
+    second_tier <- sum(newdf["100", "n_hit"], newdf["98.7", "n_hit"], na.rm = T)
+    third_tier <- sum(newdf["100", "n_hit"], as.numeric(newdf["98.7", "n_hit"]), as.numeric(newdf["94.5", "n_hit"]), na.rm = T)
+    fourth_tier <- sum(newdf["100", "n_hit"], as.numeric(newdf["98.7", "n_hit"]), as.numeric(newdf["94.5", "n_hit"]), as.numeric(newdf["bad", "n_hit"]), na.rm = T)
+    loopdf <- data.frame(DB=rep(dbs[i], 4), Set=rep(setvec[o], 4), treshold=c("100", "98.7", "94.5", "lower"), count=c(perfect, second_tier, third_tier, fourth_tier))
+    loopdf$freq <- (loopdf$count/max(loopdf$count))*100
+    output <- rbind(output, loopdf)
+  }
+}
+
+output$Set <- factor(output$Set, levels = c("Top100", "Top1000", "All (2822)"))
+output$treshold <- factor(output$treshold, levels = c("100", "98.7", "94.5", "lower"))
+output <- output %>% mutate(treshold = recode(treshold, "100" = "Perfect hit", "98.7" = ">98.7%", "94.5" = ">94.5%"))
+wo_lower <- subset(output, !(treshold %in% c("lower"))) %>% mutate(freq = round(freq,1))
+```
+
+### Barplot of mapping identities for the two databases
+```{r, warning=F, message=FALSE, fig.height=4.5, fig.width=7}
+ggplot(wo_lower, aes(x=DB, y=freq, fill=factor(Set))) + geom_bar(position= position_dodge(width=0.9), stat="identity") + facet_grid(~treshold) + geom_text(aes(label=round(freq, 1), vjust = -0.5), position=position_dodge(width=0.9), size=3) + scale_fill_colorblind(name="ASV set") + ylab("Frequency [% of total alignments]") + theme_bw() #+ 
+#ggsave(file = "figures/AAW_zOTUs_vs_dbs_mapIDs_bar.png", width = 12, height = 8, dpi = 600)
+```
+
+##### BARPLOT FOR ONLINEDNA MEETING - DELETE!!!
+```{r, warning=F, message=FALSE, fig.height=4.5, fig.width=7}
+barplot_meet <- subset(wo_lower, Set == "Top100" & treshold == "Perfect hit")
+ggplot(barplot_meet, aes(x=DB, y=freq, fill=factor(DB))) + geom_bar(position= position_dodge(width=0.9), stat="identity") + facet_grid(~treshold) + geom_text(aes(label=round(freq, 1), vjust = -0.5), position=position_dodge(width=0.9), size=3) + scale_fill_colorblind(name="Database") + ylab("Frequency [% of total alignments]") + theme_bw() + xlab("")#+ 
+#ggsave(file = "figures/AAW_zOTUs_vs_dbs_mapIDs_bar.png", width = 12, height = 8, dpi = 600)
+```
+
+### Boxplot of mapping identities for the two databases
+```{r, warning=F, message=FALSE, fig.height=4.5, fig.width=7}
+ess_df <- all %>% select(db, set, MapID) %>% group_by(db, set)
+ess_df$percent <- ess_df$MapID*100
+ess_df$set <- factor(ess_df$set, levels = c("Top100", "Top1000", "All (2822)"))
+
+ggplot(ess_df, aes(x=set, y=percent, fill=db)) + geom_boxplot() + coord_cartesian(ylim = c(95, 100)) + ylab("Mapping identity [%]") + xlab("") + labs(fill = "Database") + scale_fill_colorblind() + theme_bw() + theme(panel.grid.major.x = element_blank())# + 
+#ggsave(file = "figures/AAW_zOTUs_vs_dbs_mapIDs_box.png", width = 12, height = 8, dpi = 600)
+```
+
+
+# Flowchart of experimental workflow
+```{r workflow, fig.width=15, fig.cap="Experimental workflow"}
+knitr::include_graphics("Onsite_paper-flowchart.png")
+```
+\pagebreak
+
+
+# Identifying the technical variation in sequencing data
+
+In order to understand how trustworthy the observed community is it can be beneficial to identify the technical variation introduced in the sequencing library preparation. Thus, technical replicates have been identified, clustered into OTUs at 97% identity and mapped to MiDAS 3.1. These data are visualised below.
+
+NEW: Make zOTUs and map to them! 
+Find Illumina samples, quality filter and merge reads.
+```{bash, eval=F}
+sh seqdata/illumina/controls/get_samples.sh
+```
+
+Unique sequences from the sequencing data are extracted prior to clustering
+```{bash, eval=F}
+usearch10 -fastx_uniques seqdata/illumina/controls/merged_l.fastq -fastaout map_db_test/uniques.fasta -sizeout -relabel Uniq -minuniquesize 2 -threads 16
+```
+
+Cluster unique sequences into zOTUs/ASVs. zOTUs are created by clustering the unique sequences (sequencing errors are corrected, chimeras are removed)
+```{bash, eval=F}
+usearch10 -unoise3 map_db_test/uniques.fasta -zotus map_db_test/zotus_controls.fa -tabbedout map_db_test/unoise3_controls_log.txt -threads 16
+```
+
+Fix ZOTU bug. Usearch has a bug and won't work if ZOTUs are named ZOTUs - rename to ASVs
+```{bash, eval=F}
+sed -i 's/Zotu/ASV/g' map_db_test/zotus_controls.fa
+```
+
+The merged reads are not recognised by usearch as deriving from multiple samples, so the sequencing IDs need to be appended to the headers. First the sampleid file, produced by the `get_samples.sh` script, is modified to fit into the downstream workflow
+```{bash, eval=F}
+sed 's/\t/ /g' seqdata/illumina/controls/sampleid.txt | sed 's/^>/@/' > seqdata/illumina/controls/patterns
+```
+
+As the samples are from different MiSeq runs, several barcodes have been used more than once. Therefore it is necessary to match both the sequencing run identifier and the barcode before appending a unique sequencing ID. The patterns are appended to read headers using awk to match these.
+```{bash, eval=F}
+awk 'BEGIN{OFS=";"}
+  NR==FNR{
+    rnr=substr($1,1,27)
+    bnr=$2
+    gsub("-", "_", $3)
+    rl[rnr" "bnr]=$3
+    #print $0
+    next
+  }
+  FNR%4==1{
+    rnr=substr($1,1,27)
+    bnr=$2
+    h=rnr" "bnr
+    #print h
+    for (i in rl){
+      if (h == i) {
+        print $1, $2, "sample=" rl[i]
+        getline; print;
+        getline; print;
+        getline; print;
+      }
+    }
+  }
+' seqdata/illumina/controls/patterns seqdata/illumina/controls/merged_l.fastq > seqdata/illumina/controls/merged_fix.fq
+```
+
+#### zOTU/ASV approach
+The headers now ensure that usearch identifies multiple samples. The ZOTUs are used to create a zOTUtable by mapping the quality-trimmed and header-fixed sequencing data back to the zOTUs
+```{bash, eval=F}
+usearch10 -otutab seqdata/illumina/controls/merged_fix.fq -zotus map_db_test/zotus_controls.fa -otutabout map_db_test/zotutab_controls.txt -mapout map_db_test/zmap_controls.txt -threads 16
+```
+
+Map zOTUs to MiDAS 3.1
+```{bash, eval=F}
+# MiDAS 3.1
+usearch10 -usearch_global map_db_test/zotus_controls.fa -db db/midas31/MiDAS-31-single.fa -strand plus -id 0.97 -maxaccepts 0 -maxrejects 0 -samout map_db_test/mappings/zotus_controls_usearch_midas31.sam -threads 16
+```
+
+Remove secondary and split mappings
+```{bash, eval=F}
+awk '$2 == 0' map_db_test/mappings/zotus_controls_usearch_midas31.sam > map_db_test/mappings/zotus_controls_usearch_midas31_filt.sam
+```
+
+Calculate mapping errors
+```{bash, eval=F}
+### // USEARCH10 //
+awk '{
+    for(i=1;i<=NF;i++){
+      if($i ~ /^NM:i:/){sub("NM:i:", "", $i); mm = $i}
+    }
+    split($6, count, /[^0-9]+/);
+    split($6, type, /[^A-Z]*/);
+    for(i=1; i<= length(count)-1; i++){
+      if(type[i + 1] ~ /[DIM]/){aln+=count[i]};
+    }
+    print $1, $2, $3, (aln - mm)/aln, $12
+    aln=0;
+  }' map_db_test/mappings/zotus_controls_usearch_midas31_filt.sam > map_db_test/zotus_controls_usearch_midas31_filt.txt
+```
+
+#### Raw alignment approach
+```{bash, eval=F}
+# Map reads to MiDAS 3.1 using minimap2
+/space/users/mha/Desktop/Onsite_paper/map_db_test/minimap2/minimap2 -ax sr -t 20 --secondary=no --MD /space/users/mha/Desktop/Onsite_paper/map_db_test/midas3/midas31_99clust.fa seqdata/illumina/controls/merged_fix.fq > map_db_test/mappings/minimap_controls_vs_midas31.sam
+
+# Remove supplementary mappings
+samtools view -F 256 -F 4 -F 2048 map_db_test/mappings/minimap_controls_vs_midas31.sam -o map_db_test/mappings/minimap_controls_vs_midas31_99clust_nodupes.sam
+
+# Calculate Levensthein distance and output selected columns
+sed '/^@/ d' map_db_test/mappings/minimap_controls_vs_midas31_99clust_nodupes.sam | \
+	awk '{
+    for(i=1;i<=NF;i++){
+      if($i ~ /^NM:i:/){sub("NM:i:", "", $i); mm = $i}
+    }
+    split($6, count, /[^0-9]+/);
+    split($6, type, /[^A-Z]*/);
+    for(i=1; i<= length(count)-1; i++){
+      if(type[i + 1] ~ /[DIM]/){aln+=count[i]};
+    }
+    print $1, $2, $3, length($10), aln, (aln - mm)/aln, $12, $14, $20
+    aln=0;
+  }' > idmapped_controls_clust.txt
+
+# Change barcode column and remove unwanted columns  
+awk -F"\t" -v OFS='\t' '{print $1, $3}' idmapped_controls_clust.txt | sed 's/Zbarcode=/\t/' >  map_db_test/mappings/minimap_controls_vs_midas31_99clust.txt
+```
+
+Function for processing minimap mapping in R
+```{r, warning=F, message=FALSE}
+process_midas3controls <- function(x) {
+  otu <- x$otu
+  sampleID <- x$sampleID
+  Qr <- as.numeric(x$Qlen)/as.numeric(x$alnlen)
+  MapID <- x$MapID %>% as.numeric()
+  Qlen <- x$Qlen %>% as.numeric()
+  alnlen <- x$alnlen %>% as.numeric()
+  alnscore <- x$alnscore %>% gsub(".*:", "", .) %>% as.integer()
+    x_d <- data.table(sampleID, otu, Qr, Qlen, alnlen, MapID, alnscore)
+  return(x_d)
+}
+```
+
+
+Load mapping data into R and merge with zotutable to add taxonomy
+```{r, warning=F, message=FALSE}
+#midas3_tax_controls <- fread("map_db_test/zotus_controls_usearch_midas31_filt.txt", sep = " ") %>% setNames(., c("ASV", "SAMflag", "Reference", "MapID", "alnscore")) %>% separate(Reference, c("RefESV", "Tax"), ";tax=" ) %>% select(ASV, Tax) %>% mutate(Tax = gsub("[a-z]:", "", Tax), Tax=gsub(";", "", Tax)) %>% separate(Tax, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), ",") %>% distinct()
+
+#controls_otutab <- fread("map_db_test/zotutab_controls.txt", sep = "\t") %>% rename(ASV = "#OTU ID")
+
+#controls_zotu_wtax <- inner_join(controls_otutab, midas3_tax_controls, by = "ASV") %>% rename(OTU = ASV)
+
+controls_minimap <- fread("map_db_test/mappings/minimap_controls_vs_midas31_99clust.txt", header = FALSE, sep = " ") %>% separate(V1, c("readID", "sampleID"), ";sample=") %>% select(-c(readID, V2, V9)) %>% setNames(., c("sampleID", "otu", "Qlen", "alnlen", "MapID","NMtag", "alnscore"))
+controls_minimap_s <- process_midas3controls(controls_minimap) %>% subset(MapID > 0.98)
+```
+
+Format taxonomy and controls data for loading into ampvis2
+```{r, warning=F, message=F, echo=T}
+midas3_clusttax1 <- fread("map_db_test/mappings/midas31_99clust-mapping.txt", header = FALSE, sep = "\t") %>%
+  setNames(., c("query", "RefESV", "mapID", "alnlen", "mismatch", "bits")) %>%
+  #select(query, RefESV) %>% 
+  separate(RefESV, c("RefESV", "Tax"), ";tax=") %>%
+  mutate(Tax = gsub("[a-z]:", "", Tax), Tax=gsub(";", "", Tax)) %>%
+  separate(Tax, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), ",") %>% distinct()
+midas3_clusttax <- midas3_clusttax1 %>% select(-c(mapID, alnlen, mismatch, bits))
+
+controls_OTUcounts <- controls_minimap_s %>% group_by(sampleID, otu) %>% summarise(count =n())
+
+controls_otutable <- dcast(data = controls_OTUcounts,formula = otu~sampleID, value.var = "count")
+controls_otutable[is.na(controls_otutable)] <- 0
+controls_otutable_wTAX <- inner_join(controls_otutable, midas3_clusttax, by = c("otu" = "query")) %>% select(OTU = otu, everything(), -RefESV)
+controls_otutable_wTAX <- controls_otutable_wTAX[rowSums(controls_otutable_wTAX[,2:106]) > 0, ]
+```
+
+Load data into ampvis2
+```{r, warning=F, message=F, echo=T}
+metadata_controls <- readxl::read_excel("map_db_test/metadata_merged.xlsx", col_names = TRUE) %>% as.data.frame() %>% subset(type %in% c("control")) %>% subset(!(rep %in% ("NC"))) %>% mutate(Sample_Name = gsub("-", "_", Sample_Name))
+#otutable <- read_delim("seqdata/illumina/OTU/wPCRPC/otutable.txt", col_names = TRUE, delim = "\t")
+
+#d <- amp_load(otutable = controls_zotu_wtax,
+#                   metadata = metadata_controls)
+d_controls <- amp_load(otutable = controls_otutable_wTAX, metadata = metadata_controls)
+```
+
+
+### Sequencing statistics
+The data are subsequently rarefied to the minimum read count.
+```{r, warning=F, message=F, echo=T}
+stats <- d_controls %>%
+    amp_alphadiv(measure = c("observed", "shannon"), rarefy = 10000) %>%
+    select(Sample_Name, LIB_ID, Date, RawReads, ObservedOTUs, Shannon) %>%
+    arrange(as.numeric(substring(Sample_Name,10)))
+low_reads <- subset(stats, RawReads < 10000) %>% select(Sample_Name) %>% unlist()
+
+d_s <- amp_subset_samples(d_controls, !(Sample_Name %in% low_reads))
+d_rare <- d_s
+
+min_reads <- lapply(unique(d_rare$abund), sum) %>% plyr::ldply() %>% 
+  select(V1) %>% 
+  min()
+
+# Rarefy to min reads (11k)
+d_rare$abund <- as.data.frame(t(vegan::rrarefy(t(d_rare$abund), min_reads)))
+```
+
+
+### Ordination
+```{r, warning=F, message=F, echo=T}
+amp_ordinate(data = d_rare, 
+                          type = "PCA", 
+                          transform = "hellinger", 
+                          sample_label_by = "LIB_ID",
+                          sample_color_by = "Investigator",#) +
+                          #sample_colorframe = "AnotherGroup" #or TRUE for the same as sample_color_by
+                          sample_label_size = 2) +
+    theme_classic() +
+    theme(legend.position = "bottom") #+
+    #scale_color_discrete(name = "Control")
+#ggsave(paste0("map_db_test/plots/PCRPC_controls_PCA.png"), width = 10, height = 10, dpi = 600)
+```
+LIB_IDs  "LIB-LJ003-PCRPOS-A-1", "LIB-MIDAD2018Q1Q2-POS", "MIDAD2017-PCRPOS" and "LIB-DJ282-POSPCR-A-1" seem to be outliers, which is also confirmed by the following heatmap.
+
+
+### Heatmap of all controls (rarefied)
+```{r, warning=F, message=F, echo=T}
+amp_heatmap(d_rare, 
+                             group_by = c("Date", "LIB_ID"), 
+                             #order_x_by = "Date",
+                             tax_aggregate = "Genus", 
+                             tax_show = 25,
+                             tax_add = "Phylum", 
+                             tax_class = "p__Proteobacteria",
+                             plot_colorscale = "sqrt", 
+                             color_vector = c("White", "Red"),
+                             plot_na= T,
+                             plot_values = F,
+                             tax_empty = "best",
+                             min_abundance = 0.1,
+                             max_abundance = 20,
+                             plot_values_size = 2#,
+                             #facet_by = "Samplename"
+  ) +
+    theme(axis.text.y = element_text(size = 8),
+          axis.text.x = element_text(size = 8),
+          legend.position = "none")
+  #ggsave(paste0("map_db_test/plots/PCRPC_controls_heatmap.png"), width = 15, height = 12, dpi = 600)
+```
+These controls identified as outliers are confirmed to be outliers in the heatmap and will thus be excluded in the following plots
+
+
+Subsetting - remove the outliers
+```{r, warning=F, message=F, echo=T}
+weird_libs <- c("LIB-LJ003-PCRPOS-A-1", "LIB-MIDAD2018Q1Q2-POS","LIB-DJ282-POSPCR-A-1")#, "MIDAD2017-PCRPOS")
+weird_stats <- subset(stats, LIB_ID %in% weird_libs)
+
+d_rare_s <- amp_subset_samples(d_rare, !(LIB_ID %in% weird_libs))
+```
+
+
+### Heatmap with outliers removed
+```{r, warning=F, message=F, echo=T}
+amp_heatmap(d_rare_s, 
+                             group_by = c("Date", "LIB_ID"), 
+                             #order_x_by = "Date",
+                             tax_aggregate = "Genus", 
+                             tax_show = 25,
+                             tax_add = "Phylum", 
+                             tax_class = "p__Proteobacteria",
+                             plot_colorscale = "sqrt", 
+                             color_vector = c("blue","white", "red3"),
+                             plot_na= T,
+                             plot_values = F,
+                             tax_empty = "best",
+                             min_abundance = 0.1,
+                             max_abundance = 20,
+                             plot_values_size = 2,
+                             plot_legendbreaks = c(1, 5, 10)
+  ) +
+    theme(axis.text.y = element_text(size = 8),
+          axis.text.x = element_text(size = 8),
+          legend.position = "right") #+
+  #ggsave(paste0("map_db_test/plots/PCRPC_controls_heatmap2.png"), width = 17, height = 10, dpi = 600)
+```
+
+
+### Jitter plot
+Based on 85 samples
+```{r jitter_controls, message=FALSE, warning=FALSE, fig.width=7., fig.height=5.0, fig.align='center', echo=T}
+
+# Create an ampvis2 boxplot and output the details to manipulate boxplot
+box1 <- amp_boxplot(d_rare_s,
+            group_by = "Investigator",
+            tax_show = 20,
+            tax_add = "Phylum",
+            detailed_output = TRUE)
+
+# Save the data from the detailed output in a new variable - outputs 9 replicate rows for each sample for some reason
+boxdata <- box1$plot$data %>% 
+  .[!duplicated(.), ]
+
+# Create jitter plot
+ggplot(boxdata, aes(x=Display, y=Abundance)) + 
+  #geom_point(position = position_jitterdodge()) +
+  #geom_jitter(aes()) +
+  geom_point(aes()) +
+  #scale_color_colorblind() +
+  guides(col = guide_legend(reverse = TRUE)) +
+  xlab("") + 
+  ylab("Read Abundance (%)") +
+  theme_classic() +
+  theme(axis.line = element_line(),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        panel.grid.major = element_line(color = "grey90"),
+        axis.text = element_text(size = 12),
+        legend.text = element_text(size=12),
+        legend.key.size = unit(1.5, "lines")
+        ) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, 10), breaks = seq(0, 10, 2))
+#ggsave("map_db_test/plots/PCRPC_controls_jitterplotASV.png", dpi = 600, height = 8, width = 8)
+```
+
+### Ridgeline plot
+```{r ridge_controls, message=FALSE, warning=FALSE, fig.width=7., fig.height=5.0, fig.align='center', echo=T}
+library(ggridges)
+ggplot(boxdata, aes(x = Abundance, y = Display)) + geom_density_ridges2() + theme_bw()
+```
+
+
+### Find variance of specific genera
+```{r controls_variance, message=FALSE, warning=FALSE, fig.width=7., fig.height=5.0, fig.align='center', echo=T}
+head(d_rare_s$abund)
+taxcount <- levels(as.factor(d_rare_s$tax$OTU)) %>% length()
+
+# Create an ampvis2 boxplot and output the details to manipulate boxplot
+box2 <- amp_boxplot(d_rare_s,
+            #group_by = "Investigator",
+            tax_aggregate = "OTU",
+            tax_show = taxcount,
+            #tax_add = "Phylum",
+            detailed_output = TRUE,normalise = F)
+
+# Save the data from the detailed output in a new variable - outputs 9 replicate rows for each sample for some reason
+boxdata2 <- box2$plot$data %>% 
+  .[!duplicated(.), ]
+
+
+tech_var <- boxdata2 %>% 
+  group_by(Display) %>% 
+  summarise(Mean = mean(Abundance),
+            SD = sd(Abundance),
+            SDpercent = sd(Abundance)/mean(Abundance)*100) %>% 
+  mutate(Variance = "Technical")
+###
+ggplot(tech_var, aes(x = Mean, y = SDpercent)) +
+  geom_point(size = 1) +
+  geom_smooth(se = F, color = "darkred", size = 1) +
+  scale_x_log10(limits=c(0.001,100000), breaks = c(0.001, 1, 10, 100, 1000, 10000, 100000), labels = c(0.001, 1, 10, 100, 1000, 10000, 100000)) +
+  scale_y_continuous(limits=c(0,650), breaks = c(0, 20, 50, 100, 150, 200, 275, 650)) +
+  xlab("Mean count") +
+  ylab("SD as % of mean count") +
+  #geom_hline(y=15, linetype = "dashed", color = "darkred") +
+  #geom_vline(x=10, linetype = "dashed", color = "darkred") +
+  theme(legend.position = "none",
+        text = element_text(size = 8, color = "black"),
+        axis.text = element_text(size = 8, color = "black"),
+        axis.text.y = element_text(hjust = 1),
+        plot.margin = unit(c(0,0,0,0), "mm"),
+        axis.line = element_line(color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey95"),
+        axis.ticks = element_line(color = "black"),
+        axis.ticks.length = unit(1, "mm"),
+        panel.background = element_blank()
+        )
+```
+
+
+# Comparison of the Illumina and Nanopore sequencing platforms
+This section concerns Nanopore and Illumina data generated in the laboratory at Aalborg University. A platform comparison was performed using V1-3 primers on Illumina MiSeq and Oxford Nanopore MinION.
+
+### Process data
+
+##### Process Illumina sequencing data, map to MiDAS 3.1
+```{bash eval=F}
+sh illumina_mapping.sh
+```
+
+Check phiX contamination
+```{bash eval=F}
+usearch10 -usearch_global seqdata/illumina/il_midasSTD.fastq -db /space/databases/phix/phix.fasta -strand both -id 0.97 -samout seqdata/illumina/phix_map.sam -quiet
+
+awk '$2 == 0' seqdata/illumina/phix_map.sam | wc -l
+```
+0 primary alignments - no phiX in the data.
+
+##### Process Nanopore sequencing data.
+The fastq files were obtained using guppy 2.3.5 with the flip-flop configuration. Firstly, the data should be demultiplexed, which is done here using Porechop
+```{bash eval=F}
+module load Porechop/0.2.3-foss-2018a-Python-3.6.4
+porechop -i seqdata/nanopore/20190227_V13/LIB-MHA-62-A-2/guppy235_called/ -b seqdata/nanopore/20190227_V13/LIB-MHA-62-A-2/barcodes_gup235/ --threads 20
+```
+
+As the amplicons were produced with V1-3 primers with an overhang for Illumina sequencing, it is sufficient to search for the primer sequences and trim away everything up until and including the primers. This is done using cutadapt using the primer sequences and an error rate of 15%. The script is available on ...
+```{bash eval=F}
+module load cutadapt/1.16-foss-2018a-Python-3.6.4
+sh seqdata/nanopore/20190227_V13/LIB-MHA-62-A-2/cutadapt_all.sh
+```
+
+The trimmed sequences are then sequenced on quality in filtlong
+```{bash eval=F}
+module load Filtlong/0.2.0-foss-2018a
+sh seqdata/nanopore/20190227_V13/LIB-MHA-62-A-2/filtlong_quality.sh
+```
+
+The filtered and trimmed data are then mapped to MiDAS 3.1
+```{bash eval=F}
+sh nanopore_map_v1.5.1.sh
+```
+
+##### Mapping to 99% clustered MiDAS 3.1
+Cluster MiDAS 3.1 to 99%
+```{bash eval=F}
+usearch10 -cluster_fast db/midas31/MiDAS-31-single.fa -id 0.99 -sort length -fulldp -consout map_db_test/midas3/midas31_99clust.fa
+```
+
+Map Illumina and Nanopore data to the clustered database
+```{bash eval=F}
+sh nanopore_map_v1.5.1_99clust.sh
+sh illumina_mapping_99clust.sh
+```
+
+Map clusters to original MiDAS 3.1 database to get taxonomy
+```{bash eval=F}
+usearch10 -usearch_global map_db_test/midas3/midas31_99clust.fa -db db/midas31/MiDAS-31-single.fa -strand both -id 0.95 -userout map_db_test/mappings/midas31_99clust-mapping.txt -userfields query+target+id+alnlen+mism+bits
+```
+
+### Further analysis in R
+Define function for processing loaded data in R
+```{r process_load_func, warning=F, message=F, echo=T}
+process_midas3 <- function(x) {
+  barcode <- x[,barcode]
+  if (any(colnames(x) %in% "read_time")){
+    read_time <- sub(".*T(.*?)Z", "\\1", x[,read_time])
+    read_date <- sub("(.*?)T.*", "\\1", x[,read_time])
+    read_datetime <- as.POSIXct(paste(read_date, read_time), format = "%Y-%m-%d %H:%M:%S")
+  }else{
+    read_datetime = NA
+  }
+  refE <- separate(x, otu, c("RefESV", "Tax"), ";tax=") %>% select(RefESV)
+  refT <- separate(x, otu, c("RefESV", "Tax"), ";tax=") %>% select(Tax)
+  readID <- x[,readID]
+  Qr <- as.numeric(x$Qlen)/as.numeric(x$alnlen)
+  MapID <- x[,MapID] %>% as.numeric()
+  Qlen <- x[,Qlen] %>% as.numeric()
+  alnlen <- x[, alnlen] %>% as.numeric()
+  x_d <- data.table(readID, barcode, read_datetime, refE, refT, Qr, Qlen, alnlen, MapID)
+  return(x_d)
+}
+
+process_midas3clust <- function(x) {
+  barcode <- x$barcode
+  if (any(colnames(x) %in% "read_time")){
+    read_time <- sub(".*T(.*?)Z", "\\1", x$read_time)
+    read_date <- sub("(.*?)T.*", "\\1", x$read_time)
+    read_datetime <- as.POSIXct(paste(read_date, read_time), format = "%Y-%m-%d %H:%M:%S")
+  }else{
+    read_datetime = NA
+  }
+  otu <- x$otu
+  readID <- x$readID
+  Qr <- as.numeric(x$Qlen)/as.numeric(x$alnlen)
+  MapID <- x$MapID %>% as.numeric()
+  Qlen <- x$Qlen %>% as.numeric()
+  alnlen <- x$alnlen %>% as.numeric()
+  alnscore <- x$alnscore %>% gsub(".*:", "", .) %>% as.integer()
+  if (any(colnames(x) %in% "Platform")){
+    Platform <- as.factor(x$Platform)
+    x_d <- data.table(readID, barcode, read_datetime, otu, Qr, Qlen, alnlen, MapID, alnscore, Platform)
+  }else{
+    x_d <- data.table(readID, barcode, read_datetime, otu, Qr, Qlen, alnlen, MapID, alnscore)
+  }
+  return(x_d)
+}
+```
+
+
+Load comparison data
+```{r load_compar_data, warning=F, message=F, echo=T}
+# Nanopore data, MiDAS extraction and V1-3 standard workflow
+d_np <- fread("map_db_test/mappings/minimap_npv13_gup235_midas31.txt", header = FALSE, sep = "\t") %>% setNames(., c("readID", "barcode", "add_info")) %>% separate(add_info, c("read_time", "SAMflag", "otu", "Qlen", "alnlen", "MapID", "NMtag", "alnscore", "MinimapID"), " ") %>% select(readID, read_time, barcode, otu, Qlen, alnlen, MapID)
+d_np_clust <- fread("map_db_test/mappings/minimap_npv13_gup235_midas31_99clust.txt", header = FALSE, sep = "\t") %>% setNames(., c("readID", "barcode", "add_info")) %>% separate(add_info, c("read_time", "SAMflag", "otu", "Qlen", "alnlen", "MapID","NMtag", "alnscore", "MinimapID"), " ") %>% select(readID, read_time, barcode, otu, Qlen, alnlen, MapID, alnscore)
+d_np_clust2 <- d_np_clust %>% mutate(Platform = "Nanopore")
+
+# Illumina data, MiDAS extraction and V1-3 standard workflow
+d_il <- fread("map_db_test/mappings/minimap_il_midas31_processed.txt", header = FALSE, sep = "\t") %>% setNames(., c("readID", "add_info", "V3"))%>% separate(add_info, c("barcode", "SAMflag", "otu", "Qlen", "alnlen", "MapID","NMtag", "alnscore", "MinimapID"), " ") %>% select(-V3)
+d_il_clust <- fread("map_db_test/mappings/minimap_il_midas31_99clust.txt", header = FALSE, sep = "\t") %>% setNames(., c("readID", "add_info", "V3")) %>% separate(add_info, c("barcode", "SAMflag", "otu", "Qlen", "alnlen", "MapID","NMtag", "alnscore", "MinimapID"), " ") %>% select(-V3)
+d_il_clust2 <- d_il_clust %>% mutate(Platform = "Illumina")
+
+# Process and bind together
+#d_all <- map_df(list(d_np, d_il), process_midas3)
+d_clust <- map_df(list(d_np_clust2, d_il_clust2), process_midas3clust)
+# no_clustreads <- nrow(d_clust)
+# # Subset to reads with length 430-510, alignment lengths of 420-520 and a ratio between the two of 0.9-1.1
+#d_s <- subset(d_all, Qlen > 430 & Qlen < 510 & alnlen > 420 & alnlen < 520 & Qr > 0.9 & Qr < 1.1)
+d_clust_s <- subset(d_clust, !(barcode %in% c("barcode11", "barcode12", "1:N:0:GAACCAAA+CTCGATCG", "1:N:0:GTATGCGC+GAGCTCTC")))
+
+#d_clust_s2 <- map_df(list(d_np_clust2, d_il_clust2), process_midas3clust) 
+d_clust_s2 <- d_clust_s %>% subset(., MapID > 0.88 & Qlen > 430 & Qlen < 510 & alnlen > 420 & alnlen < 520 & Qr > 0.9 & Qr < 1.1)
+
+# Clustered Nanopore reads only
+d_np_clust_reads <- process_midas3clust(d_np_clust) %>% subset(., !(barcode %in% c("barcode11", "barcode12")))
+d_np_clust_s <- d_np_clust_reads %>% subset(., Qlen > 430 & Qlen < 510 & alnlen > 420 & alnlen < 520 & Qr > 0.9 & Qr < 1.1 & MapID > 0.88)
+d_np_clust_s_min <- d_np_clust_s %>% group_by(barcode) %>% summarise(count = n()) %>% select(count) %>% min()
+
+np_clust_output <- data.frame(readID = character(), barcode = character(), read_datetime = as.POSIXct(character()), otu = character(), Qr = numeric(), Qlen = integer(), alnlen = integer(), MapID = numeric(), alnscore = integer())
+barcodes <- levels(as.factor(d_np_clust_s$barcode))
+
+for (i in seq_along(barcodes)){
+    newdf <- subset(d_np_clust_s, d_np_clust_s$barcode == barcodes[i])# %>% as.data.frame()
+    if(nrow(newdf)>d_np_clust_s_min){
+      loopdf <- sample_n(newdf, d_np_clust_s_min)
+    }else{
+      loopdf <- newdf
+    }
+    np_clust_output <- rbind(np_clust_output, loopdf)
+}
+
+
+## PSS samples
+d_np_pssclust <- fread("map_db_test/mappings/minimap_pssv13_gup315_midas31_99clust.txt", header = FALSE, sep = "\t") %>% setNames(., c("readID", "barcode", "add_info")) %>% separate(add_info, c("read_time", "SAMflag", "otu", "Qlen", "alnlen", "MapID","NMtag", "alnscore", "MinimapID"), " ") %>% select(readID, read_time, barcode, otu, Qlen, alnlen, MapID, alnscore)
+d_il_pssclust <- fread("map_db_test/mappings/minimap_ilpss_midas31_99clust.txt", header = FALSE, sep = "\t") %>% setNames(., c("readID", "add_info", "V3")) %>% separate(add_info, c("barcode", "SAMflag", "otu", "Qlen", "alnlen", "MapID","NMtag", "alnscore", "MinimapID"), " ") %>% select(-V3)
+
+d_pssclust <- map_df(list(d_np_pssclust, d_il_pssclust), process_midas3clust)
+d_pssclust_s <- subset(d_pssclust, MapID > 0.88 & Qlen > 430 & Qlen < 510 & alnlen > 420 & alnlen < 520 & Qr > 0.9 & Qr < 1.1)
+```
+
+Load metadata and convert barcode data to otutable. Finally load data into ampvis2
+```{r compar_ampvis_load, warning=F, message=F, echo=T}
+metadata_platform <- readxl::read_excel("map_db_test/metadata_merged.xlsx", col_names = TRUE) %>% as.data.frame() %>% subset(project %in% c("platform_comparison")) #%>% subset(!(Sample_Name %in% ("NP_M_unclass")))
+metadata_PSS <- readxl::read_excel("map_db_test/metadata_merged.xlsx", col_names = TRUE) %>% as.data.frame() %>% subset(project %in% c("platform_comp")) %>% subset(!(Sample_Name %in% ("NP_M_unclass")))
+
+# Count observations and create otutable
+OTUcounts <- d_s %>% group_by(barcode, RefESV) %>% summarise(count =n()) #%>% subset(count > 2)
+OTUcounts_clust <- d_clust_s %>% group_by(barcode, otu) %>% summarise(count =n())
+OTUcounts_clust2 <- d_clust_s2 %>% group_by(barcode, otu) %>% summarise(count =n())
+OTUcounts_pssclust <- d_pssclust_s %>% group_by(barcode, otu) %>% summarise(count = n())
+
+midas3_tax <- d_s %>% select(RefESV, Tax) %>% mutate(Tax = gsub("[a-z]:", "", Tax), Tax=gsub(";", "", Tax)) %>%
+  separate(Tax, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), ",") %>% distinct()
+
+midas3_clusttax1 <- fread("map_db_test/mappings/midas31_99clust-mapping.txt", header = FALSE, sep = "\t") %>%
+  setNames(., c("query", "RefESV", "mapID", "alnlen", "mismatch", "bits")) %>%
+  #select(query, RefESV) %>% 
+  separate(RefESV, c("RefESV", "Tax"), ";tax=") %>%
+  mutate(Tax = gsub("[a-z]:", "", Tax), Tax=gsub(";", "", Tax)) %>%
+  separate(Tax, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), ",") %>% distinct()
+midas3_clusttax <- midas3_clusttax1 %>% select(-c(mapID, alnlen, mismatch, bits))
+
+otutable <- dcast(data = OTUcounts,formula = RefESV~barcode, value.var = "count")
+otutable[is.na(otutable)] <- 0
+
+otutable_clust <- dcast(data = OTUcounts_clust,formula = otu~barcode, value.var = "count") %>% rename(RefESV = "otu")
+otutable_clust[is.na(otutable_clust)] <- 0
+
+otutable_clust2 <- dcast(data = OTUcounts_clust2,formula = otu~barcode, value.var = "count") %>% rename(RefESV = "otu")
+otutable_clust2[is.na(otutable_clust2)] <- 0
+
+otutable_pssclust <- dcast(data = OTUcounts_pssclust,formula = otu~barcode, value.var = "count") %>% rename(RefESV = "otu")
+otutable_pssclust[is.na(otutable_pssclust)] <- 0
+
+# Rename samples - except Illumina negative control, as it does not have any mappings with > 2 reads
+name_vec <- c(RefESV = "RefESV",
+             IL_plat_MHA_01 = "1:N:0:CTAACCTC+AGCTCGCT",
+             IL_plat_MHA_02 = "1:N:0:CTAACCTC+TCTAGAGA",
+             IL_plat_MHA_03 = "1:N:0:CTAACCTC+CTCGATCG",
+             IL_plat_MHA_04 = "1:N:0:GAACCAAA+GAGCTCTC",
+             IL_plat_MHA_05 = "1:N:0:GAACCAAA+CGAGCGAT",
+             IL_plat_MHA_06 = "1:N:0:GAACCAAA+TAGCGAGC",
+             IL_plat_MHA_07 = "1:N:0:GAACCAAA+CTAGATAG",
+             IL_plat_MHA_08 = "1:N:0:GAACCAAA+GCTCGAGA",
+             IL_plat_MHA_09 = "1:N:0:GAACCAAA+AGCTCGCT",
+             IL_plat_MHA_10 = "1:N:0:GAACCAAA+TCTAGAGA",
+             IL_plat_MHA_PC = "1:N:0:GAACCAAA+CTCGATCG",
+             IL_plat_MHA_NC = "1:N:0:GTATGCGC+GAGCTCTC",
+             NP_plat_MHA_01 = "barcode01",
+             NP_plat_MHA_02 = "barcode02",
+             NP_plat_MHA_03 = "barcode03",
+             NP_plat_MHA_04 = "barcode04",
+             NP_plat_MHA_05 = "barcode05",
+             NP_plat_MHA_06 = "barcode06",
+             NP_plat_MHA_07 = "barcode07",
+             NP_plat_MHA_08 = "barcode08",
+             NP_plat_MHA_09 = "barcode09",
+             NP_plat_MHA_10 = "barcode10",
+             NP_plat_MHA_PC = "barcode11",
+             NP_plat_MHA_NC = "barcode12")
+name_vecPSS <- c(RefESV = "RefESV",
+             IL_M_01 = "1:N:0:GTACATAC+CACTACGC",
+             IL_M_02 = "1:N:0:GTACATAC+TGCAGTCC",
+             IL_M_03 = "1:N:0:GTACATAC+ACCATAGC",
+             IL_M_04 = "1:N:0:GTACATAC+TCGACATC",
+             IL_M_05 = "1:N:0:GTACATAC+GAACACTT",
+             IL_M_06 = "1:N:0:GTACATAC+GAGCCATC",
+             IL_M_07 = "1:N:0:GTACATAC+TTGGGTAC",
+             IL_M_08 = "1:N:0:GTACATAC+AAGGCGCT",
+             IL_M_09 = "1:N:0:TCCGACAC+CACTACGC",
+             IL_M_10 = "1:N:0:TCCGACAC+TGCAGTCC",
+             IL_M_POS = "1:N:0:TCCGACAC+ACCATAGC",
+             IL_M_NEG = "1:N:0:TCCGACAC+TCGACATC",
+             NP_M_03_02_A = "barcode01",
+             NP_M_03_02_B = "barcode02",
+             NP_M_03_02_C = "barcode03",
+             NP_M_01_03 = "barcode04",
+             NP_M_02_03 = "barcode05",
+             NP_M_03_03 = "barcode06",
+             NP_M_04_03 = "barcode07",
+             NP_M_05_03 = "barcode08",
+             NP_M_06_03 = "barcode09",
+             NP_M_07_03 = "barcode10",
+             NP_M_POS = "barcode11",
+             NP_M_NEG = "barcode12")
+
+otutable_rename <- select(otutable, !!name_vec)
+otutable_clust_rename <- select(otutable_clust, !!name_vec) %>% rename(query = "RefESV")
+otutable_clust2_rename <- select(otutable_clust2, !!name_vec) %>% rename(query = "RefESV")
+otutable_pssclust_rename <- select(otutable_pssclust, !!name_vecPSS) %>% rename(query = "RefESV")
+
+# Add taxonomy
+otutable_wTAX <- inner_join(otutable_rename, midas3_tax, by = "RefESV") %>% rename(OTU = RefESV)
+otutable_wTAX <- otutable_wTAX[rowSums(otutable_wTAX[,2:24]) > 0, ]
+
+otutable_clust_wTAX <- inner_join(otutable_clust_rename, midas3_clusttax, by = "query") %>% rename(OTU = query) %>% select(-RefESV) #%>% select(OTU, everything())
+otutable_clust_wTAX <- otutable_clust_wTAX[rowSums(otutable_clust_wTAX[,2:24]) > 0, ]
+
+otutable_clust2_wTAX <- inner_join(otutable_clust2_rename, midas3_clusttax, by = "query") %>% rename(OTU = query) %>% select(-RefESV) #%>% select(OTU, everything())
+otutable_clust2_wTAX <- otutable_clust2_wTAX[rowSums(otutable_clust2_wTAX[,2:24]) > 0, ]
+
+otutable_pssclust_wTAX <- inner_join(otutable_pssclust_rename, midas3_clusttax, by = "query") %>% rename(OTU = query) %>% select(-RefESV) #%>% select(OTU, everything())
+otutable_pssclust_wTAX <- otutable_pssclust_wTAX[rowSums(otutable_pssclust_wTAX[,2:24]) > 0, ]
+
+# USE rarefied (randomly subsampled) data frame
+d_np_clust_reads_tax <- inner_join(d_np_clust_reads, midas3_clusttax, by = c("otu" = "query"))
+d_np_clust_tax <- inner_join(np_clust_output, midas3_clusttax, by = c("otu" = "query"))
+d_clust_s_tax <- inner_join(d_clust_s, midas3_clusttax, by = c("otu" = "query"))
+
+# Rename samples in the otutable according to the metadata. Change the numbers according to number of samples
+colnames(otutable_wTAX)[2:12] <- as.character(metadata_platform[13:23,1])
+colnames(otutable_clust_wTAX)[2:12] <- as.character(metadata_platform[13:23,1])
+colnames(otutable_clust2_wTAX)[2:12] <- as.character(metadata_platform[13:23,1])
+colnames(otutable_pssclust_wTAX)[2:13] <- as.character(metadata_PSS[1:12,1])
+
+# Create ampvis object
+d_amp <- amp_load(otutable = otutable_wTAX, metadata = metadata_platform)#, tree = tree_compar_r)
+d_amp_clust <- amp_load(otutable = otutable_clust_wTAX, metadata = metadata_platform)
+d_amp_clust2 <- amp_load(otutable = otutable_clust2_wTAX, metadata = metadata_platform)
+d_amp_clustPSS <- amp_load(otutable = otutable_pssclust_wTAX, metadata = metadata_PSS)
+
+# Remove negative and positive PCR controls
+d_amp_s <- amp_subset_samples(d_amp, !(rep %in% c("PC", "NC")))
+d_amp_clust_s <- amp_subset_samples(d_amp_clust, !(rep %in% c("PC", "NC")))
+d_amp_clust2_s <- amp_subset_samples(d_amp_clust2, !(rep %in% c("PC", "NC")))
+d_amp_clustPSS_s <- amp_subset_samples(d_amp_clustPSS, !(rep %in% c("neg", "pos")))
+
+# Set seed for analysis to enable reproducibility
+set.seed(42L)
+
+# Rarefy to minimum read amount
+d_amp_rare <- d_amp_s
+d_amp_clust_rare <- d_amp_clust_s
+d_amp_clust2_rare <- d_amp_clust2_s
+d_amp_clustPSS_rare <- d_amp_clustPSS_s
+
+min_reads <- lapply(unique(d_amp_s$abund), sum) %>% plyr::ldply() %>%
+  select(V1) %>%
+  min()
+min_reads_clust <- lapply(unique(d_amp_clust_s$abund), sum) %>% plyr::ldply() %>%
+  select(V1) %>%
+  min()
+min_reads_clust2 <- lapply(unique(d_amp_clust2_s$abund), sum) %>% plyr::ldply() %>%
+  select(V1) %>%
+  min()
+min_reads_clustPSS <- lapply(unique(d_amp_clustPSS_s$abund), sum) %>% plyr::ldply() %>%
+  select(V1) %>%
+  min()
+
+paste0("Minimum read count in platform comparison dataset is ", min_reads) %>% print()
+d_amp_rare$abund <- as.data.frame(t(vegan::rrarefy(t(d_amp_rare$abund), min_reads))) # Rarefy to min reads
+d_amp_clust_rare$abund <- as.data.frame(t(vegan::rrarefy(t(d_amp_clust_rare$abund), min_reads_clust))) # Rarefy to min reads
+d_amp_clust2_rare$abund <- as.data.frame(t(vegan::rrarefy(t(d_amp_clust2_rare$abund), min_reads_clust2))) # Rarefy to min reads
+d_amp_clustPSS_rare$abund <- as.data.frame(t(vegan::rrarefy(t(d_amp_clustPSS_rare$abund), min_reads_clustPSS))) # Rarefy to min reads
+```
+\pagebreak
+
+Genus-specific QC of Nanopore data
+```{r NP_QC, warning=F, message=F, echo=T}
+d_tetra_reads <- subset(d_clust_s_tax, Genus == "Tetrasphaera")
+ggplot(subset(d_tetra_reads, Platform == "Illumina"), aes(x=MapID, color = Platform)) + geom_histogram(binwidth = 0.002) + geom_vline(xintercept = 0.88) + annotate("text", x=0.86, y=300, label = "0.88 cutoff") + ggtitle("Tetrasphaera in Illumina V1-3 data") + 
+```
+
+GC% and length of Actinobacteria
+```{r actino_GC, warning=F, message=F, echo=T}
+midas31_actino_clust <- midas3_clusttax %>% subset(., Phylum == "Actinobacteria") %>% select(query) %>% unlist()
+midas31_tetra_clust <- midas3_clusttax %>% subset(., Genus == "Tetrasphaera") %>% select(query) %>% unlist()
+midas31_clusters_fa <- readDNAStringSet("map_db_test/midas3/midas31_99clust.fa")
+
+midas31_cluster_df <- data.frame(cluster = midas31_clusters_fa@ranges@NAMES, length = midas31_clusters_fa@ranges@width, GC = letterFrequency(midas31_clusters_fa, "GC", as.prob = T)[,1])
+
+## Actinobacteria
+actino_clusters <- midas31_clusters_fa[midas31_actino_clust]
+actino_df <- data.frame(cluster = actino_clusters@ranges@NAMES, length = actino_clusters@ranges@width, GC = letterFrequency(actino_clusters, "GC", as.prob = T)[,1])
+
+## Tetrasphaera
+tetra_clusters <- midas31_clusters_fa[midas31_tetra_clust]
+tetra_df <- data.frame(cluster = tetra_clusters@ranges@NAMES, length = tetra_clusters@ranges@width, GC = letterFrequency(tetra_clusters, "GC", as.prob = T)[,1])
+
+p1 <- ggplot(midas31_cluster_df, aes(x=length, y=GC)) + geom_point()
+p2 <- p1 + geom_point(data = actino_df, mapping = aes(x=length, y=GC, color = "red")) 
+p2 + geom_point(data = tetra_df, mapping = aes(x=length, y=GC, color = "blue")) + scale_color_discrete(name = "Tax", labels = c("Tetrasphaera", "Actinobacteria")) + theme_bw()
+```
+
+
+##### Create phylogenetic tree
+The ESVs in the rarefied data are used to construct a phylogenetic tree
+```{r, warning=F, message=F, echo=T}
+otus <- d_amp_rare$tax$OTU %>% droplevels()
+#write.table(otus, file = "map_db_test/ESVs_in_raredata", quote = FALSE, row.names=F, col.names = F)
+
+otus_clust <- d_amp_clust_rare$tax$OTU %>% droplevels()
+clust_esvs <- subset(midas3_clusttax, query %in% otus_clust) %>% select(RefESV) %>% distinct() %>% droplevels() %>% unlist()
+#write.table(clust_esvs, file = "map_db_test/ESVs_in_clustraredata", quote = FALSE, row.names=F, col.names = F)
+```
+
+Subset ESVs, align and create tree
+```{bash, eval = F}
+seqtk subseq /space/users/mha/Desktop/Onsite_paper/db/midas31/MiDAS-31-notax.fa map_db_test/ESVs_in_raredata > map_db_test/plat_comp_rarefiedESVs.fa
+mafft --thread 30 map_db_test/plat_comp_rarefiedESVs.fa > map_db_test/plat_comp_midas31_align_rarefied.aln
+fasttreeMP -nt map_db_test/plat_comp_midas31_align_rarefied.aln > map_db_test/plat_comp_midas31_tree_rarefied.newick
+
+# Clustered
+seqtk subseq /space/users/mha/Desktop/Onsite_paper/db/midas31/MiDAS-31-notax.fa map_db_test/ESVs_in_clustraredata > map_db_test/plat_comp_clust_rarefiedESVs.fa
+mafft --thread 30 map_db_test/plat_comp_clust_rarefiedESVs.fa > map_db_test/plat_comp_midas31_clust_align_rarefied.aln
+fasttreeMP -nt map_db_test/plat_comp_midas31_clust_align_rarefied.aln > map_db_test/plat_comp_midas31_clust_tree_rarefied.newick
+```
+
+Load new ampvis2 object with constructed tree
+```{r, warning=F, message=F, echo=T}
+# Load phylogenetic tree and root
+tree_compar <- ape::read.tree("map_db_test/plat_comp_midas31_tree_rarefied.newick")
+tree_compar_r <- ape::root(tree_compar, 1, r = TRUE)
+tree_compar_clust <- ape::read.tree("map_db_test/plat_comp_midas31_clust_tree_rarefied.newick")
+tree_compar_clust_r <- ape::root(tree_compar_clust, 1, r = TRUE)
+
+# Replace cluster identifiers with ESV identifiers in clustered OTUtable
+### FIX! Different clusters map to the same ESV, meaning that there will be duplicate ESVs in the OTUtable (read: non-unique OTUs, will not work. Consider clustering to 98% ?) ####
+#midas3_clustIDs <- midas3_clusttax %>% subset(RefESV %in% clust_esvs) %>% select(query, RefESV)
+#otutable_clust_fix <- otutable_clust_wTAX %>% subset(OTU %in% otus_clust) %>% inner_join(midas3_clustIDs, by = c("OTU" = "query")) %>% select(-OTU) %>% rename(OTU=RefESV) %>% select(OTU, everything())
+
+# Create ampvis object
+d_amp <- amp_load(otutable = otutable_wTAX, metadata = metadata_platform, tree = tree_compar_r)
+#d_amp_clust <- amp_load(otutable = otutable_clust_fix, metadata = metadata_platform, tree = tree_compar_clust_r)
+
+# Remove negative and positive PCR controls
+d_amp_s <- amp_subset_samples(d_amp, !(rep %in% c("PC", "NC")))
+#d_amp_clust_s <- amp_subset_samples(d_amp_clust, !(rep %in% c("PC", "NC")))
+
+# Set seed for analysis to enable reproducibility
+set.seed(42L)
+
+# Rarefy to minimum read amount
+d_amp_rare <- d_amp_s
+#d_amp_clust_rare <- d_amp_clust_s
+
+d_amp_rare$abund <- as.data.frame(t(vegan::rrarefy(t(d_amp_rare$abund), min_reads)))
+#d_amp_clust_rare$abund <- as.data.frame(t(vegan::rrarefy(t(d_amp_clust_rare$abund), min_reads_clust)))
+
+# Remove redundant variables
+#rm(list = ls(pattern = "^barcode|otutable|^metadata"))
+```
+
+### Stats for the platform comparison
+Sequencing statistics for the platform comparison analysis. Table \ref{fig:compar_stats} contains sequencing statistics for both Illumina MiSeq sequencing and Nanopore MinION. Nanopore data were basecalled and demultiplexed using Albacore v. 3.3.3, while Illumina data were ... Reads were mapped to the MiDAS v.2.1.3 database using [minimap2](https://github.com/lh3/minimap2).
+```{r compar_stats, warning=F, message=F, echo=T, fig.height=5, fig.align='center', fig.cap="\\label{fig:compar_stats}Sequencing stats for platform comparison"}
+# This counts the number of mapped reads based on the abundance information (otutable)
+metadata_stats <- lapply(unique(d_amp_s$abund), sum) %>% plyr::ldply() %>%
+  rename(Sample_Name = .id, readcount = V1) %>%
+  inner_join(., d_amp_s$metadata, by = "Sample_Name")
+
+stats <- metadata_stats %>%
+  select(Sample_Name, Sample_ID, rep, EXT_conc, LIB_conc, Platform, readcount) %>%
+  mutate(LIB_conc = round(LIB_conc, 1),
+         EXT_conc = round(EXT_conc, 1)) #%>%
+  #arrange(organize)
+
+colnames(stats) <- c("Sequencing\nID", "Sample\nName", "Replicate", "Extraction\nConc. [ng/uL]", "Library\nConc. [ng/uL]", "Platform", "No.\nmapped reads")
+
+
+tt2 <- ttheme_default(core=list(fg_params=list(hjust=1,
+                                                          x = 0.95,
+                                                          fontsize = 6)),
+                      colhead=list(fg_params=list(fontsize = 8)))
+
+grid.table(stats[,1:7], rows= NULL, theme = tt2)
+```
+\pagebreak
+
+
+### Heatmap, platform comparison
+```{r compar_platform_heatmap, warning=F, message=F, fig.width=7, fig.height=5.7, fig.align='center', echo=T, fig.cap="\\label{fig:compar_plat_heatmap}Overview of the 20 most abundant genera in the platform comparison experiment (V1-3)"}
+#d_amp_platform$metadata$ordered <- as.numeric(d_amp_platform$metadata$rep)
+amp_heatmap(d_amp_rare,
+            group_by = "rep",
+            facet_by = "Platform",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 20,
+            color_vector = c("blue","white", "red3"),
+            plot_values_size = 2) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom") #+
+#ggsave("map_db_test/plots/platform_mobile_heatmap.png", dpi=600, height = 7, width = 10.5)
+```
+
+\pagebreak
+
+### Heatmap, cluster platform comparison
+```{r compar_platform_heatmap_cluster, warning=F, message=F, fig.width=7, fig.height=5.7, fig.align='center', echo=T, fig.cap="\\label{fig:compar_plat_heatmap}Overview of the 20 most abundant genera in the platform comparison experiment (V1-3)"}
+#d_amp_platform$metadata$ordered <- as.numeric(d_amp_platform$metadata$rep)
+conc <- lapply(unique(d_amp_clust2_rare$abund), sum) %>% plyr::ldply() %>%
+  rename(Sample_Name = .id, readcount = V1) %>%
+  inner_join(., d_amp_clust2_rare$metadata, by = "Sample_Name") %>% 
+  select(Sample_Name, Platform, rep, LIB_conc) %>% 
+  mutate(LIB_conc = round(LIB_conc, 1))
+d_amp_clust2_rare$metadata$LIB_conc <- round(d_amp_clust2_rare$metadata$LIB_conc, 1)
+
+amp_heatmap(d_amp_clust2_rare,
+            group_by = c("rep", "LIB_conc"),
+            facet_by = "Platform",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 20,
+            color_vector = c("blue","white", "red3"),
+            plot_values_size = 2) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom") #+
+#ggsave("map_db_test/plots/platform_mobile_heatmap.png", dpi=600, height = 7, width = 10.5)
+```
+
+\pagebreak
+
+### Heatmap, PSS samples cluster platform comparison
+```{r compar_platform_heatmap_cluster, warning=F, message=F, fig.width=7, fig.height=5.7, fig.align='center', echo=T, fig.cap="\\label{fig:compar_plat_heatmap}Overview of the 20 most abundant genera in the platform comparison experiment (V1-3)"}
+d_amp_clustPSS_rare$metadata$ordered <- as.numeric(d_amp_clustPSS_rare$metadata$rep)
+amp_heatmap(d_amp_clustPSS_rare,
+            group_by = "ordered",
+            facet_by = "Platform",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 20,
+            color_vector = c("blue","white", "red3"),
+            plot_values_size = 2) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom") #+
+#ggsave("map_db_test/plots/platform_mobile_heatmap.png", dpi=600, height = 7, width = 10.5)
+```
+
+\pagebreak
+
+
+### PCOA plot, platform comparison
+```{r compar_platform_PCoA, warning=F, message=F, eval=T, echo=T, fig.height = 6,fig.width = 6, fig.align='center'}
+# amp_ordinate(d_amp_rare,
+#              type = "PCOA",
+#              transform = "none",
+#              distmeasure = "wunifrac",
+#              sample_color_by = "Platform",
+#              sample_label_by = "rep",
+#              sample_colorframe = "Platform",
+#              sample_colorframe_label = "Platform"
+#              ) +
+#   scale_color_colorblind() +
+#   scale_fill_colorblind() +
+#   theme(legend.position = "none")# +
+#ggsave("map_db_test/plots/platform_comp_PCoA_w_unifrac.png", dpi=600, height = 8, width = 8)
+```
+
+<!-- PCOA, platform comparison, clustered -->
+<!-- ```{r compar_platform_PCOA_clust, warning=F, message=F, eval=T, echo=T, fig.height = 6,fig.width = 6, fig.align='center'} -->
+<!-- amp_ordinate(d_amp_clust_rare,  -->
+<!--              type = "PCOA", -->
+<!--              transform = "none", -->
+<!--              distmeasure = "wunifrac", -->
+<!--              sample_color_by = "Platform", -->
+<!--              sample_label_by = "rep", -->
+<!--              sample_colorframe = "Platform", -->
+<!--              sample_colorframe_label = "Platform" -->
+<!--              ) +  -->
+<!--   scale_color_colorblind() + -->
+<!--   scale_fill_colorblind() + -->
+<!--   theme(legend.position = "none")# + -->
+<!-- #ggsave("map_db_test/plots/platform_comp_PCoA_w_unifrac.png", dpi=600, height = 8, width = 8) -->
+<!-- ``` -->
+
+### Jitterplot, platform comparison
+Jitterplot of the top 10 abundances observed in the two platforms, based on 10 replicates for each platform.
+```{r compar_platform_jitter, message=FALSE, warning=FALSE, fig.width=7., fig.height=5.0, fig.align='center', echo=T, fig.cap="\\label{fig:compar_plat_jitterplot}Jitter plot of the 10 most abundant genera in the platform comparison experiment"}
+# Create an ampvis2 boxplot and output the details to manipulate boxplot
+box1 <- amp_boxplot(d_amp_rare,
+            group_by = "Platform",
+            tax_show = 10,
+            tax_add = "Phylum",
+            detailed_output = TRUE)
+
+# Save the data from the detailed output in a new variable - outputs 9 replicate rows for each sample for some reason
+boxdata <- box1$plot$data %>%
+  .[!duplicated(.), ]
+
+# Create jitter plot
+ggplot(boxdata, aes(x=Display, y=Abundance, color = Group)) +
+  geom_point(position = position_jitterdodge()) +
+  scale_color_colorblind() +
+  guides(col = guide_legend(reverse = TRUE)) +
+  xlab("") +
+  ylab("Read Abundance (%)") +
+  theme_classic() +
+  theme(axis.line = element_line(),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        panel.grid.major = element_line(color = "grey90"),
+        axis.text = element_text(size = 12),
+        legend.text = element_text(size=12),
+        legend.key.size = unit(1.5, "lines")
+        ) +
+  coord_flip()
+#ggsave("figures/platform_jitterplot.png", dpi = 600, height = 6, width = 8)
+```
+
+Jitterplot for the clustered data
+```{r compar_platform_clust_jitter, message=FALSE, warning=FALSE, fig.width=7., fig.height=5.0, fig.align='center', echo=T, fig.cap="\\label{fig:compar_plat_jitterplot}Jitter plot of the 10 most abundant genera in the platform comparison experiment"}
+# Remove Tetrasphaera - temporary! REMOVE
+d_amp_clust_tetra <- amp_subset_taxa(d_amp_clust_rare, tax_vector = c("Tetrasphaera"), remove = TRUE)
+
+# Create an ampvis2 boxplot and output the details to manipulate boxplot
+box1clust <- amp_boxplot(d_amp_clust2_rare,
+            group_by = "Platform",
+            tax_show = 20,
+            tax_add = "Phylum",
+            detailed_output = TRUE)
+
+# Save the data from the detailed output in a new variable - outputs 9 replicate rows for each sample for some reason
+boxdataclust <- box1clust$plot$data %>%
+  .[!duplicated(.), ]
+
+# Create jitter plot
+ggplot(boxdataclust, aes(x=Display, y=Abundance, color = Group)) +
+  #geom_point(position = position_jitterdodge()) +
+  geom_point(position = position_dodge(width = .5)) +
+  scale_color_colorblind() +
+  guides(col = guide_legend(reverse = TRUE)) +
+  xlab("") +
+  ylab("Read Abundance (%)") +
+  theme_classic() +
+  theme(axis.line = element_line(),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        panel.grid.major = element_line(color = "grey90"),
+        axis.text = element_text(size = 12),
+        legend.text = element_text(size=12),
+        legend.key.size = unit(1.5, "lines")
+        ) +
+  coord_flip() + 
+  scale_y_continuous(limits = c(0, 10), breaks = seq(0, 10, 2))
+#ggsave("figures/platform_jitterplot.png", dpi = 600, height = 6, width = 8)
+```
+
+\pagebreak
+
+
+### 95% confidence interval as function of mean OTU count
+
+
+The square root is currently of 10, since that is the sample count.
+```{r compar_platform_conf_mean, warning=F, message=F, fig.width=7, fig.height=5.7, fig.align='center', echo=T, fig.cap="\\label{fig:compar_plat_heatmap}95% CI as function of mean OTU count"}
+clust_otutable <- amp_subset_samples(d_amp_clust_rare, Platform == "Nanopore")$abund
+
+data_clust <- data.frame(OTU = rownames(clust_otutable), clust_otutable) %>% 
+  melt(id.vars = "OTU", value.name = "Count", variable.name = "Sample") %>% 
+  group_by(OTU) %>% 
+  summarise(Mean = mean(Count),
+            pRR = sd(Count)*qt(0.975,df = n()-1)/mean(Count)*100,
+            pCI3 = (sd(Count)*qt(0.975,df = n()-1)/sqrt(10))/mean(Count)*100,
+            lowCI95 = mean(Count)-(qt(0.975, df=9)*sd(Count))/sqrt(10),
+            highCI95 = mean(Count)+(qt(0.975, df=9)*sd(Count))/sqrt(10),
+            SDpercent = sd(Count)/mean(Count)*100,
+            SD = sd(Count))
+
+
+ggplot(data_clust, aes(x = Mean, y = SDpercent)) +
+  geom_point(size = 1) +
+  geom_smooth(se = F, color = "darkred", size = 1) +
+  scale_x_log10(limits=c(1,2000), breaks = c(1, 10, 100, 1000)) +
+  scale_y_continuous(limits=c(1,200), breaks = c(0, 20, 50, 100, 150, 200)) +
+  xlab("Mean count") +
+  ylab("95% CI as % of mean count") +
+  #geom_hline(y=15, linetype = "dashed", color = "darkred") +
+  #geom_vline(x=10, linetype = "dashed", color = "darkred") +
+  theme(legend.position = "none",
+        text = element_text(size = 8, color = "black"),
+        axis.text = element_text(size = 8, color = "black"),
+        axis.text.y = element_text(hjust = 1),
+        plot.margin = unit(c(0,0,0,0), "mm"),
+        axis.line = element_line(color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey95"),
+        axis.ticks = element_line(color = "black"),
+        axis.ticks.length = unit(1, "mm"),
+        panel.background = element_blank()
+        )
+```
+
+\pagebreak
+
+Find standard deviation for all cluster for the 10 samples, and plot Tetrasphaera standard deviation on top
+```{r compar_platform_species_var, warning=F, message=F, fig.width=7, fig.height=5.7, fig.align='center', echo=T, fig.cap="\\label{fig:compar_plat_species_var}SD CI as function of mean OTU count"}
+d_np_clust_rhodo <- subset(d_np_clust_tax, Genus == "Rhodoferax")
+
+d_np_clust_tetra <- subset(d_np_clust_tax, Genus == "Tetrasphaera")
+d_np_clust_tetra2 <- d_np_clust_tetra %>% select(c(otu, barcode, read_datetime)) %>% mutate(Count = 1)
+d_np_clust_tetra3 <- d_np_clust_tetra2 %>% 
+  group_by(otu, barcode) %>% 
+  summarise(Count = n())
+d_np_clust_tetra4 <- d_np_clust_tetra3 %>% 
+  group_by(otu) %>% 
+  summarise(Mean = mean(Count),
+            SD = sd(Count),
+            SDpercent = sd(Count)/mean(Count)*100)
+
+d_np_clust_tax1 <- d_np_clust_tax %>% select(c(otu, barcode, read_datetime)) %>% mutate(Count = 1)
+d_np_clust_tax2 <- d_np_clust_tax1 %>% 
+  group_by(otu, barcode) %>% 
+  summarise(Count = n())
+d_np_clust_tax3 <- d_np_clust_tax2 %>% 
+  group_by(otu) %>% 
+  summarise(Mean = mean(Count),
+            SD = sd(Count),
+            SDpercent = sd(Count)/mean(Count)*100)
+d_np_clust_tax4 <- d_np_clust_tax3[complete.cases(d_np_clust_tax3), ]
+d_np_clust_high <- subset(d_np_clust_tax4, SDpercent > 150)
+d_np_clust_high2 <- inner_join(d_np_clust_high, midas3_clusttax, by = c("otu" = "query"))
+###
+p1 <- ggplot(d_np_clust_tetra4, aes(x = Mean, y = SDpercent)) +
+  geom_point(size = 1) +
+  geom_smooth(se = F, color = "darkred", size = 1) +
+  scale_x_log10(limits=c(1,2000), breaks = c(1, 10, 100, 1000)) +
+  scale_y_continuous(limits=c(1,200), breaks = c(0, 20, 50, 100, 150, 200)) +
+  xlab("Mean count") +
+  ylab("SD as % of mean count") +
+  #geom_hline(y=15, linetype = "dashed", color = "darkred") +
+  #geom_vline(x=10, linetype = "dashed", color = "darkred") +
+  theme(legend.position = "none",
+        text = element_text(size = 8, color = "black"),
+        axis.text = element_text(size = 8, color = "black"),
+        axis.text.y = element_text(hjust = 1),
+        plot.margin = unit(c(0,0,0,0), "mm"),
+        axis.line = element_line(color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey95"),
+        axis.ticks = element_line(color = "black"),
+        axis.ticks.length = unit(1, "mm"),
+        panel.background = element_blank()
+        )
+p1 + geom_point(data = d_np_clust_tax3, mapping = aes(x=Mean, y=SDpercent, color = "red"), size = 1)
+
+
+p2 <- ggplot(d_np_clust_tax4, aes(x = Mean, y = SDpercent)) +
+  geom_point(size = 1) +
+  geom_smooth(se = F, color = "darkred", size = 1) +
+  scale_x_log10(limits=c(1,100000), breaks = c(1, 10, 100, 1000, 10000, 100000)) +
+  scale_y_continuous(limits=c(1,350), breaks = c(0, 20, 50, 100, 150, 200, 275, 350)) +
+  xlab("Mean count") +
+  ylab("SD as % of mean count") +
+  #geom_hline(y=15, linetype = "dashed", color = "darkred") +
+  #geom_vline(x=10, linetype = "dashed", color = "darkred") +
+  theme(legend.position = "none",
+        text = element_text(size = 8, color = "black"),
+        axis.text = element_text(size = 8, color = "black"),
+        axis.text.y = element_text(hjust = 1),
+        plot.margin = unit(c(0,0,0,0), "mm"),
+        axis.line = element_line(color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey95"),
+        axis.ticks = element_line(color = "black"),
+        axis.ticks.length = unit(1, "mm"),
+        panel.background = element_blank()
+        )
+p3 <- p2 + geom_point(data=d_np_clust_tetra4, mapping = aes(x=Mean, y=SDpercent), size=2, shape=24, fill="blue")
+library(plotly)
+ggplotly(p3)
+```
+
+
+Find standard deviation for the 10 Illumina samples
+```{r compar_platform_species_var, warning=F, message=F, fig.width=7, fig.height=5.7, fig.align='center', echo=T, fig.cap="\\label{fig:compar_plat_species_var}SD CI as function of mean OTU count"}
+il_amp <- amp_subset_samples(d_rare_s)
+taxcount_il <- levels(as.factor(d_rare_s$tax$OTU)) %>% length()
+
+# Create an ampvis2 boxplot and output the details to manipulate boxplot
+box2 <- amp_boxplot(d_rare_s,
+            #group_by = "Investigator",
+            tax_aggregate = "OTU",
+            tax_show = taxcount,
+            #tax_add = "Phylum",
+            detailed_output = TRUE,normalise = F)
+
+# Save the data from the detailed output in a new variable - outputs 9 replicate rows for each sample for some reason
+boxdata2 <- box2$plot$data %>% 
+  .[!duplicated(.), ]
+
+
+tech_var <- boxdata2 %>% 
+  group_by(Display) %>% 
+  summarise(Mean = mean(Abundance),
+            SD = sd(Abundance),
+            SDpercent = sd(Abundance)/mean(Abundance)*100) %>% 
+  mutate(Variance = "Technical")
+###
+ggplot(tech_var, aes(x = Mean, y = SDpercent)) +
+  geom_point(size = 1) +
+  geom_smooth(se = F, color = "darkred", size = 1) +
+  scale_x_log10(limits=c(0.001,100000), breaks = c(0.001, 1, 10, 100, 1000, 10000, 100000), labels = c(0.001, 1, 10, 100, 1000, 10000, 100000)) +
+  scale_y_continuous(limits=c(0,650), breaks = c(0, 20, 50, 100, 150, 200, 275, 650)) +
+  xlab("Mean count") +
+  ylab("SD as % of mean count") +
+  #geom_hline(y=15, linetype = "dashed", color = "darkred") +
+  #geom_vline(x=10, linetype = "dashed", color = "darkred") +
+  theme(legend.position = "none",
+        text = element_text(size = 8, color = "black"),
+        axis.text = element_text(size = 8, color = "black"),
+        axis.text.y = element_text(hjust = 1),
+        plot.margin = unit(c(0,0,0,0), "mm"),
+        axis.line = element_line(color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey95"),
+        axis.ticks = element_line(color = "black"),
+        axis.ticks.length = unit(1, "mm"),
+        panel.background = element_blank()
+        )
+####
+
+d_np_clust_tax1 <- d_np_clust_tax %>% select(c(otu, barcode, read_datetime)) %>% mutate(Count = 1)
+d_np_clust_tax2 <- d_np_clust_tax1 %>% 
+  group_by(otu, barcode) %>% 
+  summarise(Count = n())
+d_np_clust_tax3 <- d_np_clust_tax2 %>% 
+  group_by(otu) %>% 
+  summarise(Mean = mean(Count),
+            SD = sd(Count),
+            SDpercent = sd(Count)/mean(Count)*100)
+d_np_clust_tax4 <- d_np_clust_tax3[complete.cases(d_np_clust_tax3), ]
+d_np_clust_high <- subset(d_np_clust_tax4, SDpercent > 150)
+d_np_clust_high2 <- inner_join(d_np_clust_high, midas3_clusttax, by = c("otu" = "query"))
+###
+p1 <- ggplot(d_np_clust_tetra4, aes(x = Mean, y = SDpercent)) +
+  geom_point(size = 1) +
+  geom_smooth(se = F, color = "darkred", size = 1) +
+  scale_x_log10(limits=c(1,2000), breaks = c(1, 10, 100, 1000)) +
+  scale_y_continuous(limits=c(1,200), breaks = c(0, 20, 50, 100, 150, 200)) +
+  xlab("Mean count") +
+  ylab("SD as % of mean count") +
+  #geom_hline(y=15, linetype = "dashed", color = "darkred") +
+  #geom_vline(x=10, linetype = "dashed", color = "darkred") +
+  theme(legend.position = "none",
+        text = element_text(size = 8, color = "black"),
+        axis.text = element_text(size = 8, color = "black"),
+        axis.text.y = element_text(hjust = 1),
+        plot.margin = unit(c(0,0,0,0), "mm"),
+        axis.line = element_line(color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey95"),
+        axis.ticks = element_line(color = "black"),
+        axis.ticks.length = unit(1, "mm"),
+        panel.background = element_blank()
+        )
+p1 + geom_point(data = d_np_clust_tax3, mapping = aes(x=Mean, y=SDpercent, color = "red"), size = 1)
+
+
+p2 <- ggplot(d_np_clust_tax4, aes(x = Mean, y = SDpercent)) +
+  geom_point(size = 1) +
+  geom_smooth(se = F, color = "darkred", size = 1) +
+  scale_x_log10(limits=c(1,100000), breaks = c(1, 10, 100, 1000, 10000, 100000)) +
+  scale_y_continuous(limits=c(1,350), breaks = c(0, 20, 50, 100, 150, 200, 275, 350)) +
+  xlab("Mean count") +
+  ylab("SD as % of mean count") +
+  #geom_hline(y=15, linetype = "dashed", color = "darkred") +
+  #geom_vline(x=10, linetype = "dashed", color = "darkred") +
+  theme(legend.position = "none",
+        text = element_text(size = 8, color = "black"),
+        axis.text = element_text(size = 8, color = "black"),
+        axis.text.y = element_text(hjust = 1),
+        plot.margin = unit(c(0,0,0,0), "mm"),
+        axis.line = element_line(color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey95"),
+        axis.ticks = element_line(color = "black"),
+        axis.ticks.length = unit(1, "mm"),
+        panel.background = element_blank()
+        )
+p3 <- p2 + geom_point(data=d_np_clust_tetra4, mapping = aes(x=Mean, y=SDpercent), size=2, shape=24, fill="blue")
+library(plotly)
+ggplotly(p3)
+```
+
+# Development of an onsite sequencing workflow
+Different bead beating seettings have been compared to determine the usability of the handheld bead beater and the optimal bead beating time for lysis.
+
+Load data
+```{r bb_load, message=F, warning=F, echo=T}
+# Illumina data for the bead beater analysis, standard V1-3 OTU clustering
+otutable_bb <- read_delim("bead_beater/bV1V3_midas31/otutable.txt", col_names = TRUE, delim = "\t")
+
+metadata_bb <- readxl::read_excel("map_db_test/metadata_merged.xlsx", col_names = TRUE) %>% as.data.frame() %>% subset(project %in% c("bead_beater")) # Metadata for the bead beater analysis
+
+# Create ampvis object
+d_bb <- amp_load(otutable = otutable_bb, metadata = metadata_bb) %>% amp_subset_samples(.,!(rep %in% c("neg", "pos")))
+
+# Set seed for analysis to enable reproducibility
+set.seed(42L)
+
+d_bb_rare <- d_bb
+min_reads_bb <- lapply(unique(d_bb_rare$abund), sum) %>% plyr::ldply() %>%
+  select(V1) %>%
+  min()
+
+d_bb_rare$abund <- as.data.frame(t(vegan::rrarefy(t(d_bb_rare$abund), min_reads_bb))) # Rarefy to min reads (?k)
+
+```
+
+
+### Stats for the lysis analysis
+Sequencing statistics for the lysis analysis (Table \ref{fig:bb_stats}). The sequencing data were clustered into OTUs and reads were mapped to them using usearch7. OTUs were classified to MiDAS v.2.1.3 using using the rdp classifier.
+```{r bb_stats, warning=F, message=F, echo=T, fig.height=3.7, fig.align='center', fig.cap="\\label{fig:bb_stats}Lysis sequencing stats"}
+stats <- d_bb %>%
+  amp_alphadiv(measure = c("observed", "shannon"), rarefy = 10000) %>%
+  select(Sample_Name, Sample_ID, EXT_conc, LIB_conc, RawReads, ObservedOTUs, Shannon) %>%
+  mutate(LIB_conc = round(LIB_conc, 1),
+         EXT_conc = round(EXT_conc, 1),
+         Shannon = round(Shannon, 1)) %>%
+  arrange(Sample_Name)
+
+colnames(stats) <- c("Sequencing\nID", "Sample\nName", "Extraction\nConc. [ng/uL]", "Library\nConc. [ng/uL]", "Reads", "Observed\nOTUs", "Shannon\nIndex")
+
+
+tt2 <- ttheme_default(core=list(fg_params=list(hjust=1,
+                                                          x = 0.95,
+                                                          fontsize = 6)),
+                      colhead=list(fg_params=list(fontsize = 8)))
+
+grid.table(stats, rows= NULL, theme = tt2)
+```
+\pagebreak
+
+### Heatmap, lysis analysis
+```{r compar_bead_heatmap, warning=F, message=F, eval = T, fig.width=7, fig.height=5.7, fig.align='center', echo=T, fig.cap="\\label{fig:compar_bb_heatmap}Overview of the 20 most abundant genera in the lysis experiment"}
+ch_vector <- as.character(d_bb_rare$metadata$SampleID)
+
+d_bb_rare$metadata <- mutate_at(d_bb_rare$metadata, "Lysis_time", factor, levels = c("5s", "15s", "30s", "2x30s", "Reference"))
+amp_heatmap(d_bb_rare,
+            group_by = "Sample_ID",
+            facet_by = "Lysis_time",
+            order_x_by = ch_vector,
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            color_vector = c("blue","white", "red3"),
+            plot_na= T,
+            plot_values = T,
+            tax_empty = "best",
+            min_abundance = 0.1,
+            max_abundance = 15,
+            plot_values_size = 2
+            ) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom")
+```
+The reference samples (extracted as recommended by [Albertsen et al. 2015](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0132783)), which underwent 4x40s bead beating, were processed on the FastPreP-24 (MP BIO), while the other samples were processed on the SuperFastPrep-1 (MP BIO). Samples which underwent more than one cycle of bead beating were left on ice for 2 minutes between cycles. Sample IL_BB_09 is an outlier, likely due to a sampling bias during DNA extraction.. Some bacteria are easier to lyse than others, where a genus such as Rhodoferax is the most abundant after 5s and decreasing in relative abundance when bead beating more. The Gram-positive Tetrasphaera is hardly present after 5s bead beating, but is among the 5 most abundant after 2x30s and 4x40s of bead beating.
+\pagebreak
+
+
+### PCA, lysis analysis
+```{r compar_bead_PCA, warning=F, message=F, eval = T, fig.height = 6,fig.width = 6, fig.align='center', echo=T, fig.cap="\\label{fig:compar_bb_PCA}Principal component analysis of the microbial compositions in the lysis experiment (Illumina V1-3 sequenced)"}
+amp_ordinate(d_bb_rare,
+             type = "PCA",
+             transform = "Hellinger",
+             sample_color_by = "Lysis_time",
+             sample_colorframe = "colorframe",
+             sample_colorframe_label = "Lysis_time") +
+  theme(legend.position = "none") #+
+  #ggsave("figures/lysis_PCA.png", width = 8, height = 8, dpi = 600)
+```
+Sample IL_BB_09 has been excluded from the colorframe due to the possible sampling bias. Based on the PCA it appears that the observed microbial communities become more similar with increased bead beating, where the community changes noticeably between 30s and 2x30s, but not as much if bead beating is increased to 4x40s.
+\pagebreak
+
+
+# Onsite application of the developed workflow
+The data analysed here were produced and analyzed onsite at Aalborg West wastewater treatment plant.
+
+Demultiplex basecalled data
+```{bash eval=F}
+module load Porechop/0.2.3-foss-2018a-Python-3.6.4
+porechop -i guppy235_called/ -b barcodes_gup235/ --threads 20
+
+for i in $(seq -w 09 12);
+do
+sed -i "s/sampleid=20171024_Kirk3gaard_onsitedemo_RAB201/barcode=barcode$i/" barcodes_gup235/BC"$i".fastq
+done
+cat barcodes_gup235/BC*.fastq > np_onsite_gup235_demultiplexed.fastq
+```
+
+Map and process data
+```{bash eval=F}
+sh seqdata/nanopore/20171024_onsite_data/nanopore_map_onsite_v1.5.1.sh
+```
+
+
+Load and process data
+```{r load_process_onsite, warning=F, message=F, echo=T}
+d_on <- fread("map_db_test/mappings/onsite_gup235_midas31.txt", header = FALSE, sep = "\t") %>% setNames(., c("readID", "barcode", "add_info")) %>% separate(add_info, c("read_time", "SAMflag", "otu", "Qlen", "alnlen", "MapID", "NMtag", "alnscore", "MinimapID"), " ") %>% select(readID, read_time, barcode, otu, Qlen, alnlen, MapID)
+
+d_onsite_np <- d_on %>% process_midas3()
+```
+
+
+Load metadata (1 sample) and convert barcode data to otutable. Finally load data into ampvis2
+```{r onsite_ampvis_load, warning=F, message=F, echo=T}
+metadata_onsite <- fread(file = "20171024_onsiteDemo/metadata_onsite.txt", sep = "\t", header = T)
+
+otutable_onsite <- subset(d_onsite_np, barcode == "barcode12") %>% group_by(RefESV) %>% summarise(Sample = n()) #%>% subset(Sample > 2)
+
+# Count observations and create otutable
+midas3_tax_onsite <- d_onsite_np %>% select(RefESV, Tax) %>% mutate(Tax = gsub("[a-z]:", "", Tax), Tax=gsub(";", "", Tax)) %>% separate(Tax, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), ",") %>% distinct()
+
+# Add taxonomy
+otutable_onsite_wTAX <- inner_join(otutable_onsite, midas3_tax_onsite, by = "RefESV") %>% rename(OTU = RefESV)
+
+metadata_AS <- metadata_onsite[4,]
+metadata_AS$SampleID <- "Sample"
+d_amp_on <- amp_load(otutable = otutable_onsite_wTAX, metadata = metadata_AS)
+```
+
+
+### Sequencing statistics, onsite application
+Sequencing statistics for the sample over the entire sequencing run (`r round(as.numeric(max(d_onsite_np$read_datetime)-min(d_onsite_np$read_datetime)),2)` days)
+```{r onsite_stats, warning=F, message=F, echo=T, fig.height=1.5, fig.align='center', fig.cap="\\label{fig:onsite_stats}Onsite sequencing stats"}
+# This counts the number of mapped reads based on the abundance information (otutable)
+metadata_stats <- lapply(unique(d_amp_on$abund), sum) %>% plyr::ldply() %>%
+  rename(SampleID = .id, readcount = V1) %>%
+  inner_join(., d_amp_on$metadata, by = "SampleID")
+
+stats <- metadata_stats %>%
+  select(SampleID, readcount)
+
+colnames(stats) <- c("Sequencing\nID", "No.\nmapped reads")
+
+
+tt2 <- ttheme_default(core=list(fg_params=list(hjust=1,
+                                                          x = 0.95,
+                                                          fontsize = 6)),
+                      colhead=list(fg_params=list(fontsize = 8)))
+
+grid.table(stats, rows= NULL, theme = tt2)
+```
+\pagebreak
+
+
+### Heatmap with MiDAS functions
+In Figure \ref{fig:onsite_heatmap} the 25 most abundant genera in the sample sequenced onsite are shown. MiDAS functions have been assigned to genera.
+```{r onsite_heatmap_functions, warning=F, message=F, fig.width=8.3, fig.height=7.3, fig.align='center', echo=T, fig.cap="\\label{fig:onsite_heatmap}Onsite heatmap with MiDAS-assigned functions"}
+d_amp_on_fix <- d_amp_on
+#d_amp_on_fix$tax$Genus <- d_amp_on_fix$tax$Genus %>% gsub("_", " ", .)
+amp_heatmap(d_amp_on,
+            group_by = "SampleID",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            tax_show = 25,
+            plot_colorscale = "sqrt",
+            color_vector = c("blue","white", "red3"),
+            plot_na= T,
+            plot_values = T,
+            tax_empty = "best",
+            min_abundance = 0.1,
+            max_abundance = 15,
+            plot_functions = TRUE,
+            functions = c("FIL", "AOB", "NOB", "PAO", "GAO"),
+            rel_widths = c(0.75, 0.25)
+            )
+#ggsave("map_db_test/plots/onsite_heatmap_func.png", width = 8.3, height = 7.3, dpi = 600)
+```
+The functional information would allow operators to quickly understand whether the current community is healthy and able to carry out the functions needed, such as oxidizing ammonia. [consider adding controls to heatmap? should there be comparisons to standard MiDAS samples on MiSeq, or do we leave it as a "proof of concept"?]
+\pagebreak
+
+
+### Abundance development over sequencing time
+Analyzing the abundance development through sequencing time yields information about how long time is necessary to sequence to obtain a stable community profile.
+```{r abundance_over_time, warning=F, message=F, fig.width=7, fig.height=6, fig.align='center', echo=T, fig.cap="\\label{fig:onsite_abund_dev}Onsite abundance development over sequencing time"}
+d_all <- subset(d_onsite_np, barcode == "barcode12")
+d_all <- d_all %>% mutate(Tax = gsub("[a-z]:", "", Tax), Tax=gsub(";", "", Tax)) %>% separate(Tax, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), ",")
+
+t_start <- min(d_all$read_datetime)
+totreads <- nrow(d_all)
+
+## Start conditions for genus_loop ##
+t1 <- t_start
+datacount <- list()
+readcount <- 0
+cumreadcount <- 0
+
+ind_count <- function(df, x) {
+  d_otu <- df %>%
+    group_by(Genus) %>%
+    summarise(abund = n()) %>%
+    as.data.frame(stringsAsFactors = FALSE)# %>%
+  return(d_otu)
+}
+
+genus_loop <- function(df, t, d_all) {
+  t1 <- t
+  datacount <- list()
+  readcount <- 0
+  cumreadcount <- 0
+  for (i in 1:60) {
+    data <- ind_count(subset(df, read_datetime >= t1 & read_datetime < t1+60))
+    readcount <- as.numeric(data$abund) + as.numeric(readcount)
+    data$cumgenuscount <- as.numeric(readcount)
+    #
+    allreadcount <- as.numeric(nrow(subset(d_all, read_datetime >= t1 & read_datetime < t1+60)))
+    data$allreadcount <- allreadcount
+    cumreadcount <- as.numeric(cumreadcount) + as.numeric(allreadcount)
+    data$cumreadcount <- cumreadcount
+    #
+    t1 <- t1 + 60
+    data$dataset <- i
+    datacount[[i]] <- data
+  }
+  genusdata <- do.call(rbind, datacount)
+  return(genusdata)
+}
+
+
+# Create vector with 10 most abundant genera, based on ampvis2 heatmap
+top10 <- amp_heatmap(d_amp_on, group_by = "SampleID", tax_aggregate = "Genus", tax_show = 10, textmap = T) %>% rownames()# %>% paste("g__", ., sep="")
+
+# Create list with the top 10 genera and their read timestamps
+top_genus_list <- d_all %>%
+  subset(., Genus %in% top10) %>%
+  split(.$Genus)
+
+# Create dataframe for abundance development plot
+genusdata <- lapply(top_genus_list, genus_loop, t = t_start, d_all = d_all) %>%
+  do.call("rbind", .) %>%
+  mutate(fraction = (cumgenuscount/cumreadcount)*100,
+         time = dataset
+         )
+
+# Plot abundance development over time
+ggplot(genusdata, aes(x=time, y=fraction, color = Genus)) +
+  geom_line(size=1) +
+  scale_y_continuous(breaks=seq(0, 10, 1), limits = c(0, 10)) +
+  scale_x_continuous(breaks=seq(0, 60, 10), limits = c(0,60)) +
+  theme_bw() +
+  ylab("Abundance [% of total barcode reads]") +
+  xlab("Sequencing time [minutes]") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        legend.title = element_text(size=10, face="bold"),
+        legend.text = element_text(size=8),
+        axis.text = element_text(size=8),
+        axis.title = element_text(size = 10),
+        legend.position = "bottom") +
+  guides(col = guide_legend(nrow = 2))
+#ggsave("figures/onsite_top10abundance_time.png", width = 9, height = 6, dpi=600)
+```
+Comparing the read abundances of the 10 most abundant genera over sequencing time (\ref{fig:onsite_abund_dev}) confirmed that, for this experiment, 30 minutes of sequencing was sufficient. This corresponded to `r as.numeric(nrow(subset(d_all, read_datetime < min(read_datetime)+60*30)))` reads assigned to the barcoded sample. The abundances started to stabilize after about 10 minutes (`r as.numeric(nrow(subset(d_all, read_datetime < min(read_datetime)+60*10)))` reads), which might be sufficient for an estimation of the abundances in the sample.
+\pagebreak
+
+### 95% confidence interval of FL16S as function of mean OTU count
+```{r compar_platform_conf_mean, warning=F, message=F, fig.width=7, fig.height=5.7, fig.align='center', echo=T, fig.cap="\\label{fig:compar_plat_heatmap}95% CI as function of mean OTU count"}
+onsite_sample <- subset(d_onsite_np, barcode == "barcode12")
+
+
+###
+
+data_CI_onsite <- data.frame(OTU = rownames(onsite_otutab), onsite_otutab) %>% 
+  melt(id.vars = "OTU", value.name = "Count", variable.name = "Sample") %>% 
+  group_by(OTU) %>% 
+  summarise(Mean = mean(Count),
+            pRR = sd(Count)*qt(0.975,df = n()-1)/mean(Count)*100,
+            pCI3 = (sd(Count)*qt(0.975,df = n()-1)/sqrt(3))/mean(Count)*100)
+
+
+ggplot(data_CI_onsite, aes(x = Mean, y = pCI3)) +
+  geom_point(size = 1) +
+  geom_smooth(se = F, color = "darkred", size = 1) +
+  scale_x_log10(limits=c(1,2000), breaks = c(1, 10, 100, 1000)) +
+  scale_y_continuous(limits=c(1,200), breaks = c(0, 20, 50, 100, 150, 200)) +
+  xlab("Mean count") +
+  ylab("95% CI as % of mean count") +
+  #geom_hline(y=15, linetype = "dashed", color = "darkred") +
+  #geom_vline(x=10, linetype = "dashed", color = "darkred") +
+  theme(legend.position = "none",
+        text = element_text(size = 8, color = "black"),
+        axis.text = element_text(size = 8, color = "black"),
+        axis.text.y = element_text(hjust = 1),
+        plot.margin = unit(c(0,0,0,0), "mm"),
+        axis.line = element_line(color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey95"),
+        axis.ticks = element_line(color = "black"),
+        axis.ticks.length = unit(1, "mm"),
+        panel.background = element_blank()
+        )
+```
+
+\pagebreak
