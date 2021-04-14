@@ -1,0 +1,1 @@
+This repository contains shell scripts for generating data used in the "Onsite microbial community profiling at water resource recovery facilities enables microbe-informed operational interventions" paper. Rmarkdown files are also available, used for analysis and visualisation.
