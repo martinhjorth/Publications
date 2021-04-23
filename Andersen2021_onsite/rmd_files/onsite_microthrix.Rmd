@@ -1,0 +1,324 @@
+---
+title: "Workflow application for Microthrix detection"
+author: "Martin Andersen"
+date: "17/09/2020"
+output: html_document
+---
+
+Map data to MiDAS 3.7 and process data
+```{bash eval=F}
+bash nanopore_mapping-to-otutable_v1.3-mk1C.sh
+```
+
+Define function for processing mappings
+```{r warning=F, message=F, echo=T}
+process_midas3_onsite <- function(x) {
+  if (any(colnames(x) %in% "read_time")){
+    read_time <- sub(".*T(.*?)", "\\1", x$read_time)
+    read_date <- sub("(.*?)T.*", "\\1", x$read_time)
+    read_datetime <- as.POSIXct(paste(read_date, read_time), format = "%Y-%m-%d %H:%M:%S")
+  }else{
+    read_datetime = NA
+  }
+  OTU <- x$OTU
+  SeqID <- x$SeqID
+  readID <- x$readID
+  Qr <- x$Qr
+  MapID <- x$MapID %>% as.numeric()
+  Qlen <- x$Qlen %>% as.numeric()
+  alnlen <- x$alnlen %>% as.numeric()
+  alnscore <- x$alnscore %>% gsub(".*:", "", .) %>% as.integer()
+  if (any(colnames(x) %in% "Platform")){
+    Platform <- as.factor(x$Platform)
+    x_d <- data.table(readID, barcode, read_datetime, otu, Qr, Qlen, alnlen, MapID, alnscore, Platform)
+  }else{
+    x_d <- data.table(readID, SeqID, read_datetime, OTU, Qr, Qlen, alnlen, MapID, alnscore)
+  }
+  return(x_d)
+}
+```
+
+
+Load in otutable, metadata and mappings
+```{r load_process_onsite, warning=F, message=F, echo=T}
+onsite_otutable <- fread("data/2020-10-08_CP692-hac-otutable-midas37_filt15.txt", header = TRUE, sep = "\t")
+onsite_metadata <- readxl::read_excel("data/CP692_metadata.xlsx") %>% 
+  subset(Libtype == "bV1V9")
+
+amp_onsite <- amp_load(otutable = onsite_otutable,
+                   metadata = onsite_metadata)
+
+onsite_mappings <- fread("data/2020-10-08_CP692-hac-mappings-midas37_filt15.txt", header = TRUE, sep = "\t") %>% process_midas3_onsite()
+
+# Merge mappings with taxonomy
+onsite_map_tax <- inner_join(onsite_mappings, amp_onsite$tax, by = "OTU")
+```
+
+### QC fast vs. hac basecalling
+```{r}
+midas_tax <- fread("data/midas37_tax.txt", header = FALSE, sep = "\t", col.names = c("FLASV", "Tax")) %>% mutate(Tax = gsub("[a-z]__", "", Tax)) %>% separate(Tax, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), "; ")
+
+onsite_mappings_hac <- fread("data/2020-10-08_CP692-hac-mappings-midas37_filt15.txt", header = TRUE, sep = "\t") %>% process_midas3_onsite() %>% mutate(basecall = "hac")
+onsite_mappings_fast <- fread("data/2020-10-08_CP692-fast-mappings-midas37_filt15.txt", header = TRUE, sep = "\t") %>% process_midas3_onsite() %>% mutate(basecall = "fast")
+
+onsite_mappings_base <- rbind(onsite_mappings_hac, onsite_mappings_fast) %>% inner_join(., midas_tax, by = c("OTU" = "FLASV"))
+
+top10_species <- onsite_mappings_base %>% subset(basecall == "hac") %>% group_by(Species) %>% summarise(count = n()) %>% arrange(count) %>% tail(., 10) %>% select(Species) %>% unlist()
+
+onsite_mappings_top10 <- subset(onsite_mappings_base, Species %in% top10_species) %>% mutate(MapID = MapID*100)
+
+stat_box_data <- function(y, upper_limit = max(onsite_mappings_top10$MapID) * 1.12) {
+  return(
+    data.frame(
+      y=0.90 * upper_limit,
+      label = paste0('c=', length(y), '\n',
+                    'm=', round(mean(y), 1), '\n')
+    )
+  )
+}
+
+ggplot(onsite_mappings_top10, aes(x=Species, y = MapID, fill = basecall)) + 
+  geom_violin() + 
+  stat_summary(
+    fun.data = stat_box_data,
+    geom = "text",
+    hjust = 0.5,
+    vjust = 0.9,
+    size = 3,
+    position = position_dodge(width = 0.75)
+  ) + theme_bw()
+
+
+## Ampvis checks
+fast_otu <- fread("data/2020-10-08_CP692-fast-otutable-midas37_filt15.txt", header = TRUE, sep = "\t") %>% rename(barcode01_fast = barcode01, barcode02_fast = barcode02)
+hac_otu <- fread("data/2020-10-08_CP692-hac-otutable-midas37_filt15.txt", header = TRUE, sep = "\t") %>% rename(barcode01_hac = barcode01, barcode02_hac = barcode02)
+
+both_otu <- fast_otu %>% select(OTU, barcode01_fast, barcode02_fast) %>% inner_join(., hac_otu, by = "OTU")
+
+amp_both <- amp_load(otutable = both_otu, metadata = onsite_metadata)
+
+amp_heatmap(amp_both,
+            group_by = c("Samplename"),
+            facet_by = "Reactor",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 30,
+            color_vector = c("blue","white", "red3"),
+            plot_values_size = 2, textmap=F) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom")
+
+
+## Jitter
+
+box1 <- amp_boxplot(amp_both,
+            group_by = "Reactor",
+            tax_show = 30,
+            tax_add = "Phylum",
+            detailed_output = TRUE)
+
+# Save the data from the detailed output in a new variable - outputs 9 replicate rows for each sample for some reason
+boxdata <- box1$plot$data %>%
+  .[!duplicated(.), ]
+
+# Create jitter plot
+ggplot(boxdata, aes(x=Display, y=Abundance, color = Group)) +
+  geom_point(position = position_dodge(width = .6), alpha = 0.8, size = 2.1) +
+  scale_color_colorblind() +
+  guides(col = guide_legend(reverse = TRUE)) +
+  xlab("") +
+  ylab("Read Abundance (%)") +
+  theme_classic() +
+  theme(axis.line = element_line(),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        panel.grid.major = element_line(color = "grey90"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size=14),
+        legend.key.size = unit(1.5, "lines")
+        ) +
+  coord_flip() + 
+  scale_y_continuous(limits = c(0, 8), breaks = seq(0, 8, 1))
+```
+
+Almost no difference between "hac" and "fast" basecalling
+
+### Sequencing statistics, onsite application
+Sequencing statistics for the two samples sequenced onsite
+```{r onsite_stats, warning=F, message=F, echo=T, fig.height=1.5, fig.align='center', fig.cap="\\label{fig:onsite_stats}Onsite sequencing stats"}
+onsite_stats <- amp_onsite %>%
+  amp_alphadiv(measure = c("observed", "shannon"), rarefy = 10000) %>% 
+  select(SeqID, Samplename, ConcExt, ConcLib, RawReads, ObservedOTUs, Shannon) %>%
+  mutate(ConcLib = round(ConcLib, 1),
+         ConcExt = round(ConcExt, 1),
+         Shannon = round(Shannon, 1)) %>%
+  mutate(ConcLib = replace(ConcLib, ConcLib < 0.2, "< 0.2"),
+         ConcExt = replace(ConcExt, ConcExt < 2, "< 2")) %>%
+  arrange(parse_number(SeqID))
+
+colnames(onsite_stats) <- c("Sequencing\nID", "Sample\nName", "Extraction\nConc. [ng/uL]", "Library\nConc. [ng/uL]", "Reads", "Observed\nOTUs", "Shannon\nIndex")
+
+tt2 <- ttheme_default(core=list(fg_params=list(hjust=1, 
+                                                          x = 0.95, 
+                                                          fontsize = 6)),
+                      colhead=list(fg_params=list(fontsize = 8)))
+grid.table(onsite_stats, rows= NULL, theme = tt2)
+```
+
+Rarefy
+```{r}
+set.seed(42)
+amp_onsite_rare <- amp_onsite
+min_reads_onsite <- lapply(unique(amp_onsite_rare$abund), sum) %>% plyr::ldply() %>%
+ select(V1) %>%
+ min()
+
+# Rarefy
+amp_onsite_rare$abund <- as.data.frame(t(vegan::rrarefy(t(amp_onsite_rare$abund), min_reads_onsite))) # Rarefy to min reads
+```
+
+
+### Heatmap with MiDAS functions
+In Figure \ref{fig:onsite_heatmap} the 25 most abundant genera in the sample sequenced onsite are shown. MiDAS functions have been assigned to genera.
+```{r onsite_heatmap_functions, warning=F, message=F, fig.width=8.3, fig.height=7.3, fig.align='center', echo=T, fig.cap="\\label{fig:onsite_heatmap}Onsite heatmap with MiDAS-assigned functions"}
+p1 <- amp_heatmap(amp_onsite_rare,
+            group_by = "Samplename",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            tax_show = 30,
+            plot_colorscale = "sqrt",
+            #color_vector = c("blue","white", "red3"),
+            plot_na= T,
+            plot_values = T,
+            tax_empty = "best",
+            min_abundance = 0.7,
+            max_abundance = 7,
+            plot_functions = TRUE,
+            functions = c("Filamentous", "AOB", "NOB", "PAO", "GAO"),
+            rel_widths = c(0.60, 0.40)
+            )# + ggsave("plots/_onsite_heatmap_func_midas33.png", width = 7.0, height = 7.0, dpi = 600)
+p1$heatmap$theme$axis.text.x$size <- 12
+p1$heatmap$theme$axis.text.y$size <- 12
+p1$functions$theme$axis.text.x$size <- 12
+p1# +
+# ggsave(paste0("plots/", format(Sys.time(), "%Y-%m-%d"), "_CP692_onsite_heatmap_func_midas37.png"), width = 7.0, height = 7.0, dpi = 600)
+```
+
+Species-heatmap
+In Figure \ref{fig:onsite_heatmap} the 25 most abundant genera in the sample sequenced onsite are shown. MiDAS functions have been assigned to genera.
+```{r onsite_heatmap_sp, warning=F, message=F, fig.width=8.3, fig.height=7.3, fig.align='center', echo=T, fig.cap="\\label{fig:onsite_heatmap}Onsite heatmap with MiDAS-assigned functions"}
+p1sp <- amp_heatmap(amp_onsite_rare,
+            group_by = "Samplename",
+            tax_aggregate = "Species",
+            tax_add = "Genus",
+            tax_show = 20,
+            plot_colorscale = "sqrt",
+            #color_vector = c("blue","white", "red3"),
+            plot_na= T,
+            plot_values = T,
+            tax_empty = "best",
+            min_abundance = 0.7,
+            max_abundance = 5,
+            plot_functions = FALSE#,
+            #functions = c("Filamentous", "AOB", "NOB", "PAO", "GAO"),
+            #rel_widths = c(0.60, 0.40)
+            )# + ggsave("plots/_onsite_heatmap_func_midas33.png", width = 7.0, height = 7.0, dpi = 600)
+p1sp$heatmap$theme$axis.text.x$size <- 12
+p1sp$heatmap$theme$axis.text.y$size <- 12
+p1sp$functions$theme$axis.text.x$size <- 12
+p1sp# +
+# ggsave(paste0("plots/", format(Sys.time(), "%Y-%m-%d"), "_CP692_onsite_heatmap_species_func_midas37.png"), width = 4.2, height = 5.5, dpi = 600)
+```
+
+### Abundance development over sequencing time - Flotation sludge
+Analyzing the abundance development through sequencing time yields information about how long time is necessary to sequence to obtain a stable community profile.
+```{r abundance_over_time, warning=F, message=F, fig.width=7, fig.height=6, fig.align='center', echo=T, fig.cap="\\label{fig:onsite_abund_dev}Onsite abundance development over sequencing time"}
+# Subset to flotation sludge
+onsite_map_flot <- subset(onsite_map_tax, SeqID == "barcode02")
+amp_barcode2 <- amp_subset_samples(amp_onsite_rare, SeqID == "barcode02")
+
+d_all <- onsite_map_flot
+
+
+t_start <- min(d_all$read_datetime)
+t_end <- max(d_all$read_datetime)
+t_dif <- difftime(t_end, t_start) %>% as.integer()
+totreads <- nrow(d_all)
+
+## Start conditions for genus_loop ##
+datacount <- list()
+readcount <- 0
+cumreadcount <- 0
+
+ind_count <- function(df, x) {
+  d_otu <- df %>%
+    group_by(Genus) %>%
+    summarise(abund = n()) %>%
+    as.data.frame(stringsAsFactors = FALSE)# %>%
+  return(d_otu)
+}
+
+genus_loop <- function(df, d_all, t_start) {
+  t_list <- min(df$read_datetime)
+  t_d_all <- t_start
+  datacount <- list()
+  readcount <- 0
+  cumreadcount <- 0
+  for (i in 1:t_dif) {
+    data <- ind_count(subset(df, read_datetime >= t_list & read_datetime < t_list+60))
+    readcount <- as.numeric(data$abund) + as.numeric(readcount)
+    data$cumgenuscount <- as.numeric(readcount)
+    #
+    allreadcount <- as.numeric(nrow(subset(d_all, read_datetime >= t_d_all & read_datetime < t_d_all+60)))
+    data$allreadcount <- allreadcount
+    cumreadcount <- as.numeric(cumreadcount) + as.numeric(allreadcount)
+    data$cumreadcount <- cumreadcount
+    #
+    t_list <- t_list + 60
+    t_d_all <- t_d_all + 60
+    data$dataset <- i
+    datacount[[i]] <- data
+  }
+  genusdata <- do.call(rbind, datacount)
+  return(genusdata)
+}
+
+# Create vector with 10 most abundant genera, based on ampvis2 heatmap
+top10 <- amp_heatmap(amp_barcode2, group_by = "SeqID", tax_aggregate = "Genus", tax_show = 10, textmap = T) %>% rownames()# %>% paste("g__", ., sep="")
+
+# Create list with the top 10 genera and their read timestamps
+top_genus_list <- d_all %>%
+  subset(., Genus %in% top10) %>%
+  split(.$Genus)
+
+# Create dataframe for abundance development plot
+genusdata <- lapply(top_genus_list, genus_loop, d_all = d_all, t_start = t_start) %>%
+  do.call("rbind", .) %>%
+  mutate(fraction = (cumgenuscount/cumreadcount)*100,
+         time = dataset
+         )
+
+# Plot abundance development over time
+ggplot(genusdata, aes(x=time, y=fraction, color = Genus)) +
+  geom_line(size=1, alpha = 0.5) +
+  geom_text(data = subset(genusdata, time %in% c(5, 10, 20, 30, 40, 50)), aes(time, 8, label=cumreadcount), color = "black") +
+  geom_text(data = subset(genusdata, time %in% c(5, 10, 20, 30, 40, 50)), aes(time, fraction, label=cumgenuscount, color = Genus), vjust = 1, check_overlap = TRUE) +
+  scale_y_continuous(breaks=seq(0, 8, 1), limits = c(0, 8.5)) +
+  scale_x_continuous(breaks=seq(0, t_dif, 10), limits = c(0,t_dif)) +
+  theme_bw() +
+  ylab("Relative abundance [%]") +
+  xlab("Sequencing time [minutes]") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        legend.title = element_text(size=14, face="bold"),
+        legend.text = element_text(size=12),
+        axis.text = element_text(size=12),
+        axis.title = element_text(size = 14),
+        legend.position = "bottom") +
+  guides(col = guide_legend(nrow = 3)) #+
+# ggsave(paste0("plots/", format(Sys.time(), "%Y-%m-%d"), "_CP692_onsite_top10abundance_time_midas37.png"), width = 10, height = 7, dpi=600)
+```

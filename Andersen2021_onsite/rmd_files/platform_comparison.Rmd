@@ -1,0 +1,595 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+This section concerns Nanopore and Illumina data generated in the laboratory at Aalborg University. A platform comparison was performed using V1-3 primers on Illumina MiSeq and Oxford Nanopore MinION.
+
+### Process data
+
+##### Process Illumina sequencing data, map to MiDAS 3.7
+```{bash eval=F}
+sh illumina_mapping-platform.sh
+```
+
+Check phiX contamination
+```{bash eval=F}
+usearch10 -usearch_global seqdata/illumina/il_midasSTD.fastq -db /space/databases/phix/phix.fasta -strand both -id 0.97 -samout seqdata/illumina/phix_map.sam -quiet
+
+awk '$2 == 0' seqdata/illumina/phix_map.sam | wc -l
+```
+0 primary alignments - no phiX in the data.
+
+##### Process Nanopore sequencing data.
+The fastq files were obtained using guppy 3.1.5 with the high-accuracy model. The data were demultiplexed with guppy 3.1.5 barcoding software.
+As the amplicons were produced with V1-3 primers with an overhang for Illumina sequencing, it is sufficient to search for the primer sequences and trim away everything up until and including the primers. This is done using cutadapt using the primer sequences and an error rate of 15%. The script is available on ...
+```{bash eval=F}
+module load cutadapt/1.16-foss-2018a-Python-3.6.4
+sh seqdata/nanopore/2019-08-07_V13/lib4/gup315_called_demulti/cutadapt_all.sh
+```
+
+The trimmed sequences are then sequenced on quality in filtlong
+```{bash eval=F}
+module load Filtlong/0.2.0-foss-2018a
+sh seqdata/nanopore/2019-08-07_V13/lib4/gup315_called_demulti/filtlong_quality.sh
+```
+
+
+##### Mapping to clustered MiDAS 3.7
+Cluster MiDAS 3.7 to 99%
+```{bash eval=F}
+usearch10 -cluster_fast db/midas37/midas37_single.fa -id 0.99 -sort length -fulldp -consout db/midas37/midas37_99clust.fa
+```
+
+
+Map Illumina and Nanopore data to the clustered database
+```{bash eval=F}
+bash nanopore_map_v1.5.1_99clust_gup.sh
+bash illumina_mapping_99clust-lib4.sh
+bash illumina_mapping_99clust-lib3.sh
+
+# Map Nanopore lib4 data to unclustered MiDAS 3.7
+bash nanopore_mapping-to-otutable_v1.3.sh
+```
+
+Map clusters to original MiDAS 3.7 database to get taxonomy
+```{bash eval=F}
+usearch10 -usearch_global db/midas37/midas37_99clust.fa -db db/midas37/midas37_single.fa -strand both -id 0.95 -userout mappings/midas37_99clust-mapping.txt -userfields query+target+id+alnlen+mism+bits
+```
+
+### Further analysis in R
+Define function for processing loaded data in R
+```{r process_load_func, warning=F, message=F, echo=T}
+process_midas3clust_minimap <- function(x) {
+  barcode <- sub("barcode=", "\\1", x$barcode)
+  if (any(colnames(x) %in% "read_time")){
+    read_time <- sub(".*T(.*?)Z", "\\1", x$read_time)
+    read_date <- sub("(.*?)T.*", "\\1", x$read_time)
+    read_datetime <- as.POSIXct(paste(read_date, read_time), format = "%Y-%m-%d %H:%M:%S")
+  }else{
+    read_datetime = NA
+  }
+  otu <- x$otu
+  readID <- x$readID
+  Qr <- as.numeric(x$Qlen)/as.numeric(x$alnlen)
+  MapID <- x$MapID %>% as.numeric()
+  Qlen <- x$Qlen %>% as.numeric()
+  alnlen <- x$alnlen %>% as.numeric()
+  alnscore <- x$alnscore %>% gsub(".*:", "", .) %>% as.integer()
+  if (any(colnames(x) %in% "Platform")){
+    Platform <- as.factor(x$Platform)
+    x_d <- data.table(readID, barcode, read_datetime, otu, Qr, Qlen, alnlen, MapID, alnscore, Platform)
+  }else{
+    x_d <- data.table(readID, barcode, read_datetime, otu, Qr, Qlen, alnlen, MapID, alnscore)
+  }
+  return(x_d)
+}
+```
+
+#### QC read accuracies
+```{r}
+# Raw reads
+## Get phred scores from all reads in lib4 and calculate accuracy, then get quantiles
+lib4_nanoplot <- fread("data/2020-10-08_lib4_NanoPlot-data.tsv")
+lib4_nanoStats <- lib4_nanoplot %>% mutate(accuracy = 100-(10^(-quals/10)*100), dataset="NanoPlot")
+lib4_nanoStats2 <- lib4_nanoStats %>% group_by(dataset) %>% summarise(count = n(), meanAcc = mean(accuracy), median = median(accuracy), max = max(accuracy), SD = sd(accuracy))
+summary(lib4_nanoStats$accuracy)
+quantile(lib4_nanoStats$accuracy, seq(0, 1, 0.1))
+mean(lib4_nanoStats$accuracy)
+
+## Nanopore usually reports mode accuracy, but R does not have a built-in function for calculating that - function from https://www.tutorialspoint.com/r/r_mean_median_mode.htm
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+getmode(lib4_nanoStats$accuracy) # 91.83%
+
+
+ggplot(lib4_nanoStats) + geom_violin(aes(x=dataset, y=accuracy)) +
+  geom_text(data = lib4_nanoStats2, aes(x = dataset, y = meanAcc, label = paste0("av=",round(meanAcc,2)))) + 
+  geom_text(data = lib4_nanoStats2, aes(x = dataset, y = 101, label = paste0("med=",round(median,2)))) + 
+  geom_text(data = lib4_nanoStats2, aes(x = dataset, y = 103, label = paste0("n=", format(count, nsmall=1, big.mark=",")))) +
+  ggtitle("Read accuracies of Nanopore library 4 (raw reads converted phred scores)") +
+  theme_bw()
+```
+
+#### Compare data
+Load comparison data
+```{r load_compar_data, warning=F, message=F, echo=T}
+d_np_clust_lib4 <- fread("data/2021-01-19_minimap-npv13-lib4-gup315-midas37-99clust.txt", header = FALSE, sep = "\t") %>% setNames(., c("readID", "read_time", "add_info")) %>% separate(add_info, c("barcode", "SAMflag", "otu", "Qlen", "alnlen", "MapID","NMtag", "alnscore", "MinimapID"), " ") %>% select(readID, read_time, barcode, otu, Qlen, alnlen, MapID, alnscore)  %>% mutate(Platform = "Nanopore")
+
+# Illumina data, MiDAS extraction and V1-3 standard workflow - lib3 = extraction replicates (extraction variance) ; lib4 = spatial replicates (biomass sampling variance)
+d_il_clust_lib3 <- fread("data/2021-01-19_minimap_il-lib3_midas37_99clust_processed.txt", header = FALSE, sep = "\t") %>% setNames(., c("readID", "add_info", "V3")) %>% separate(add_info, c("barcode", "SAMflag", "otu", "Qlen", "alnlen", "MapID","NMtag", "alnscore", "MinimapID"), " ") %>% select(-V3)
+d_il_clust2_lib3 <- d_il_clust_lib3 %>% mutate(Platform = "Illumina") %>% process_midas3clust_minimap()
+
+d_il_clust_lib4 <- fread("data/2021-01-19_minimap_il-lib4_midas37_99clust_processed.txt", header = FALSE, sep = "\t") %>% setNames(., c("readID", "add_info", "V3")) %>% dplyr::select(-V3) %>% separate(add_info, c("barcode", "SAMflag", "otu", "Qlen", "alnlen", "MapID","NMtag", "alnscore", "MinimapID"), " ") %>% mutate(Platform = "Illumina") %>% process_midas3clust_minimap()
+d_il_clust_lib4_2 <- d_il_clust_lib4 %>% subset(., !(barcode %in% c("1:N:0:AATCAGTC+GTATCTGC", "1:N:0:AATCAGTC+CGAGGGAA")))
+
+# Process and bind together
+d_clust <- map_df(list(d_np_clust_lib4, d_il_clust_lib4), process_midas3clust_minimap)
+
+## Subset to reads with length 430-510, alignment lengths of 420-520 and a ratio between the two of 0.9-1.1
+d_clust_s <- subset(d_clust, !(barcode %in% c("barcode11", "barcode12", "1:N:0:AATCAGTC+GTATCTGC", "1:N:0:AATCAGTC+CGAGGGAA")))
+```
+
+QC of data
+```{r compar_qcing, warning=F, message=F, echo=T, eval=F}
+stat_box_data <- function(y, upper_limit = max(d_clust_s$MapID) * 1.12) {
+  return(
+    data.frame(
+      y=0.95 * upper_limit,
+      label = paste0('c=', length(y), '\n',
+                    'm=', round(mean(y), 3), '\n')
+    )
+  )
+}
+
+ggplot(d_clust_s, aes(x=Platform, y=MapID)) + 
+  geom_boxplot() + 
+  stat_summary(
+    fun.data = stat_box_data,
+    geom = "text",
+    hjust = 0.5,
+    vjust = 0.9,
+    size = 3,
+    position = position_dodge(width = 0.75)
+  ) +
+  ylab("Mapping identity [%]") +
+  theme_bw() + theme(panel.grid.major.x = element_blank())
+
+ggplot(d_clust_s, aes(x=MapID, color = Platform)) + geom_histogram(binwidth = 0.002) + 
+  ggtitle("Mapping identities for the two platforms")
+
+ggplot(d_clust_s, aes(x=alnlen, color = Platform)) + geom_histogram(binwidth = 10) + 
+  ggtitle("Alignment lengths for the two platforms")
+
+ggplot(d_clust_s, aes(x=Qlen, color = Platform)) + geom_histogram(binwidth = 10) + 
+  ggtitle("Query lengths for the two platforms") + scale_x_continuous(limits = c(100, 1000), breaks = seq(0, 1000, 100))
+
+ggplot(d_clust_s, aes(x=Qr, color = Platform)) + geom_histogram(binwidth = 0.05) + 
+  ggtitle("Query/alignment length ratios for the two platforms") + scale_x_continuous(limits = c(0.4, 1.5))
+
+np_lib4_qc <- d_clust_s %>% subset(Platform == "Nanopore") %>%
+  mutate(Library = "Original")
+np_lib4_filt <- np_lib4_qc %>% subset(.,MapID > 0.85) %>% mutate(Library = ">85% identity")
+np_lib4_filt_qc <- rbind(np_lib4_filt, np_lib4_qc) %>% mutate(MapID = MapID*100)
+
+ggplot(np_lib4_filt_qc, aes(x=Library, y=MapID)) + 
+  geom_violin() + 
+  stat_summary(
+    fun.data = stat_box_data,
+    geom = "text",
+    hjust = 0.5,
+    vjust = 0.9,
+    size = 3,
+    position = position_dodge(width = 0.75)
+  ) +
+  ylab("Mapping identity [%]") +
+  ggtitle("Distribution of Nanopore reads in Lib4") +
+  theme_bw() + theme(panel.grid.major.x = element_blank())
+  
+
+ggplot(np_lib4_qc, aes(x=Platform, y=MapID)) + 
+  geom_boxplot() + 
+  stat_summary(
+    fun.data = stat_box_data,
+    geom = "text",
+    hjust = 0.5,
+    vjust = 0.9,
+    size = 3,
+    position = position_dodge(width = 0.75)
+  ) +
+  ylab("Mapping identity [%]") +
+  ggtitle("Distribution of Nanopore reads in Lib4")
+  theme_bw() + theme(panel.grid.major.x = element_blank())
+```
+
+
+Load metadata and convert barcode data to otutable. Finally load data into ampvis2
+```{r compar_ampvis_load, warning=F, message=F, echo=T}
+d_clust_s2 <- d_clust_s %>% subset(., MapID > 0.85 & Qlen > 420 & Qlen < 540 & alnlen > 420 & alnlen < 540 & Qr > 0.9 & Qr < 1.1)
+
+metadata_platform <- readxl::read_excel("data/metadata_merged.xlsx", col_names = TRUE) %>% as.data.frame() %>% subset(project %in% c("platform_comparison") & organize %in% c("lib4")) %>% arrange(Sample_ID)
+
+metadata_lib4 <- readxl::read_excel("data/metadata_merged.xlsx", col_names = TRUE) %>% as.data.frame() %>% subset(project %in% c("platform_comparison") & organize %in% c("lib4") & Platform %in% c("Illumina")) %>% arrange(Sample_ID)
+metadata_lib3 <- readxl::read_excel("data/metadata_merged.xlsx", col_names = TRUE) %>% as.data.frame() %>% subset(project %in% c("platform_comparison") & organize %in% c("lib3") & Platform %in% c("Illumina")) %>% arrange(Sample_ID)
+
+OTUcounts_clust2 <- d_clust_s2 %>% group_by(barcode, otu) %>% summarise(count =n())
+OTUcounts_lib4 <- d_il_clust_lib4_2 %>% group_by(barcode, otu) %>% summarise(count =n())
+
+## Illumina lib 3 - extraction variance
+OTUcounts_lib3 <- d_il_clust2_lib3 %>% group_by(barcode, otu) %>% summarise(count =n())
+
+
+midas3_clusttax1 <- fread("data/midas37_99clust-mapping.txt", header = FALSE, sep = "\t") %>%
+  setNames(., c("query", "RefESV", "mapID", "alnlen", "mismatch", "bits")) %>%
+  separate(RefESV, c("RefESV", "Tax"), ";tax=") %>%
+  mutate(Tax = gsub("[a-z]:", "", Tax), Tax=gsub(";", "", Tax)) %>%
+  separate(Tax, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), ",") %>% distinct()
+midas3_clusttax <- midas3_clusttax1 %>% dplyr::select(-c(mapID, alnlen, mismatch, bits))
+
+# Create otutables
+otutable_clust2 <- dcast(data = OTUcounts_clust2,formula = otu~barcode, value.var = "count") %>% dplyr::rename("RefESV" = otu)
+otutable_clust2[is.na(otutable_clust2)] <- 0
+
+otutable_lib4 <- dcast(data = OTUcounts_lib4,formula = otu~barcode, value.var = "count") %>% dplyr::rename("RefESV" = otu)
+otutable_lib4[is.na(otutable_lib4)] <- 0
+
+otutable_lib3 <- dcast(data = OTUcounts_lib3,formula = otu~barcode, value.var = "count") %>% dplyr::rename("RefESV" = otu)
+otutable_lib3[is.na(otutable_lib3)] <- 0
+
+
+# Rename samples
+name_vec_lib4 <- c(RefESV = "RefESV",
+             IL_plat_MHA_01 = "1:N:0:GGAGACAA+GCGATATA",
+             IL_plat_MHA_02 = "1:N:0:GGAGACAA+AGTCGTGC",
+             IL_plat_MHA_03 = "1:N:0:GGAGACAA+GTATCTGC",
+             IL_plat_MHA_04 = "1:N:0:GGAGACAA+CGAGGGAA",
+             IL_plat_MHA_05 = "1:N:0:GGAGACAA+CAAATTCG",
+             IL_plat_MHA_06 = "1:N:0:GGAGACAA+AGATTGAC",
+             IL_plat_MHA_07 = "1:N:0:GGAGACAA+AGTTACGA",
+             IL_plat_MHA_08 = "1:N:0:GGAGACAA+GCATATGC",
+             IL_plat_MHA_09 = "1:N:0:AATCAGTC+GCGATATA",
+             IL_plat_MHA_10 = "1:N:0:AATCAGTC+AGTCGTGC",
+             NP_plat_MHA_01 = "barcode01",
+             NP_plat_MHA_02 = "barcode02",
+             NP_plat_MHA_03 = "barcode03",
+             NP_plat_MHA_04 = "barcode04",
+             NP_plat_MHA_05 = "barcode05",
+             NP_plat_MHA_06 = "barcode06",
+             NP_plat_MHA_07 = "barcode07",
+             NP_plat_MHA_08 = "barcode08",
+             NP_plat_MHA_09 = "barcode09",
+             NP_plat_MHA_10 = "barcode10")
+
+names_lib4 <- c(RefESV = "RefESV",
+             IL_plat_MHA_01 = "1:N:0:GGAGACAA+GCGATATA",
+             IL_plat_MHA_02 = "1:N:0:GGAGACAA+AGTCGTGC",
+             IL_plat_MHA_03 = "1:N:0:GGAGACAA+GTATCTGC",
+             IL_plat_MHA_04 = "1:N:0:GGAGACAA+CGAGGGAA",
+             IL_plat_MHA_05 = "1:N:0:GGAGACAA+CAAATTCG",
+             IL_plat_MHA_06 = "1:N:0:GGAGACAA+AGATTGAC",
+             IL_plat_MHA_07 = "1:N:0:GGAGACAA+AGTTACGA",
+             IL_plat_MHA_08 = "1:N:0:GGAGACAA+GCATATGC",
+             IL_plat_MHA_09 = "1:N:0:AATCAGTC+GCGATATA",
+             IL_plat_MHA_10 = "1:N:0:AATCAGTC+AGTCGTGC")
+
+names_lib3 <- c(RefESV = "RefESV",
+             IL_plat_MHA_01 = "1:N:0:AGCTGTTG+GAGCTCTC",
+             IL_plat_MHA_02 = "1:N:0:AGCTGTTG+CGAGCGAT",
+             IL_plat_MHA_03 = "1:N:0:AGCTGTTG+TAGCGAGC",
+             IL_plat_MHA_04 = "1:N:0:AGCTGTTG+CTAGATAG",
+             IL_plat_MHA_05 = "1:N:0:AGCTGTTG+GCTCGAGA",
+             IL_plat_MHA_06 = "1:N:0:AGCTGTTG+AGCTCGCT",
+             IL_plat_MHA_07 = "1:N:0:AGCTGTTG+TCTAGAGA",
+             IL_plat_MHA_08 = "1:N:0:AGCTGTTG+CTCGATCG",
+             IL_plat_MHA_09 = "1:N:0:GGATGGTG+GAGCTCTC",
+             IL_plat_MHA_10 = "1:N:0:GGATGGTG+CGAGCGAT")
+
+otutable_clust2_rename <- dplyr::select(otutable_clust2, !!name_vec_lib4) %>% dplyr::rename("query" = RefESV)
+otutable_lib4_rename <- dplyr::select(otutable_lib4, !!names_lib4) %>% dplyr::rename("query" = RefESV)
+otutable_lib3_rename <- dplyr::select(otutable_lib3, !!names_lib3) %>% dplyr::rename("query" = RefESV)
+
+
+# Add taxonomy
+otutable_clust2_wTAX <- inner_join(otutable_clust2_rename, midas3_clusttax, by = "query") %>% dplyr::rename("OTU" = query) %>% dplyr::select(-RefESV)
+otutable_clust2_wTAX <- otutable_clust2_wTAX[rowSums(otutable_clust2_wTAX[,2:21]) > 0, ]
+
+otutable_lib4_wTAX <- inner_join(otutable_lib4_rename, midas3_clusttax, by = "query") %>% dplyr::rename("OTU" = query) %>% dplyr::select(-RefESV)
+otutable_lib4_wTAX <- otutable_lib4_wTAX[rowSums(otutable_lib4_wTAX[,2:11]) > 0, ]
+
+otutable_lib3_wTAX <- inner_join(otutable_lib3_rename, midas3_clusttax, by = "query") %>% dplyr::rename("OTU" = query) %>% dplyr::select(-RefESV)
+otutable_lib3_wTAX <- otutable_lib3_wTAX[rowSums(otutable_lib3_wTAX[,2:11]) > 0, ]
+
+
+# Rename samples in the otutable according to the metadata. Change the numbers according to number of samples
+colnames(otutable_clust2_wTAX)[2:11] <- as.character(metadata_platform[1:10,1])
+colnames(otutable_lib4_wTAX)[2:11] <- as.character(metadata_lib4[1:10,1])
+colnames(otutable_lib3_wTAX)[2:11] <- as.character(metadata_lib3[1:10,1])
+```
+
+
+```{r, warning=F, message=F, echo=T}
+# Create ampvis object
+d_amp_clust2 <- amp_load(otutable = otutable_clust2_wTAX, metadata = metadata_platform)
+
+d_amp_il_lib4 <- amp_load(otutable = otutable_lib4_wTAX, metadata = metadata_lib4)
+d_amp_il_lib3 <- amp_load(otutable = otutable_lib3_wTAX, metadata = metadata_lib3)
+
+# Set seed for analysis to enable reproducibility
+set.seed(42L)
+
+# Rarefy to minimum read amount
+d_amp_clust2_rare <- d_amp_clust2
+d_amp_il_lib4_rare <- d_amp_il_lib4
+d_amp_il_lib3_rare <- d_amp_il_lib3
+
+
+min_reads_clust2 <- lapply(unique(d_amp_clust2$abund), sum) %>% plyr::ldply() %>%
+  dplyr::select(V1) %>%
+  min()
+
+min_reads_il_lib4 <- lapply(unique(d_amp_il_lib4$abund), sum) %>% plyr::ldply() %>%
+  dplyr::select(V1) %>%
+  min()
+
+min_reads_il_lib3 <- lapply(unique(d_amp_il_lib3$abund), sum) %>% plyr::ldply() %>%
+ select(V1) %>%
+ min()
+
+paste0("Minimum read count in platform comparison dataset is ", min_reads_clust2) %>% print()
+d_amp_clust2_rare$abund <- as.data.frame(t(vegan::rrarefy(t(d_amp_clust2_rare$abund), min_reads_clust2))) # Rarefy to min reads
+
+# for variance estimation, make sure all data sets are rarefied to minimum read count - that is lib3 with 30457 reads
+d_amp_il_lib4_rare$abund <- as.data.frame(t(vegan::rrarefy(t(d_amp_il_lib4_rare$abund), min_reads_il_lib3))) # Rarefy to min reads
+d_amp_il_lib3_rare$abund <- as.data.frame(t(vegan::rrarefy(t(d_amp_il_lib3_rare$abund), min_reads_il_lib3))) # Rarefy to min reads
+```
+\pagebreak
+
+
+##### Create phylogenetic tree
+The ESVs in the rarefied data are used to construct a phylogenetic tree. First a fasta file is exported, an alignment is made and a tree is constructed
+```{r, warning=F, message=F, echo=T}
+otus_clust <- d_amp_clust2_rare$tax$OTU
+clust_esvs <- subset(midas3_clusttax, query %in% otus_clust) %>% select(RefESV) %>% distinct() %>% droplevels() %>% unlist()
+# write.table(otus_clust, file = "data/plat_comp_data_midas37_99clusters", quote = FALSE, row.names=F, col.names = F)
+```
+
+Subset ESVs from MiDAS3.7, align and create tree
+```{bash, eval = F}
+# Clustered
+module load seqtk/1.3-foss-2018a
+seqtk subseq db/midas37/midas37_99clust.fa mappings/plat_comp_data_midas37_99clusters > mappings/platform_comp_rare_exported_seqs_midas37-99clust.fa
+
+module load MAFFT/7.402-foss-2018a-with-extensions
+mafft --thread 30 mappings/platform_comp_rare_exported_seqs_midas37-99clust.fa > mappings/plat_comp_midas37_99clust_align_rarefied.aln
+
+module load FastTree/2.1.10-foss-2018a
+fasttreeMP -nt mappings/plat_comp_midas37_99clust_align_rarefied.aln > mappings/plat_comp_midas37_99clust_tree_rarefied-lib4.newick
+```
+
+Load new ampvis2 object with constructed tree
+```{r, warning=F, message=F, echo=T}
+# Load phylogenetic tree and root
+tree_compar_clust <- ape::read.tree("data/plat_comp_midas37_99clust_tree_rarefied-lib4.newick")
+tree_compar_clust_r <- ape::root(tree_compar_clust, 1, r = TRUE)
+
+# Create ampvis object
+d_amp_clust2_tree <- amp_load(otutable = otutable_clust2_wTAX, metadata = metadata_platform, tree = tree_compar_clust_r)
+
+# Set seed for analysis to enable reproducibility
+set.seed(42L)
+
+# Rarefy to minimum read amount
+d_amp_clust2_tree_r <- d_amp_clust2_tree
+d_amp_clust2_tree_r$abund <- as.data.frame(t(vegan::rrarefy(t(d_amp_clust2_tree_r$abund), min_reads_clust2)))
+```
+
+### Stats for the platform comparison
+Sequencing statistics for the platform comparison analysis. Table \ref{fig:compar_stats} contains sequencing statistics for both Illumina MiSeq sequencing and Nanopore MinION. Nanopore data were basecalled and demultiplexed using Guppy v. 3.1.5, while Illumina data were ... Reads were mapped to the MiDAS v.3.7 database using [minimap2](https://github.com/lh3/minimap2) v. 2.17.
+```{r compar_stats, warning=F, message=F, echo=T, fig.height=5, fig.align='center', fig.cap="\\label{fig:compar_stats}Sequencing stats for platform comparison"}
+stats_platform <- d_amp_clust2_tree %>%
+  amp_alphadiv(measure = c("observed", "shannon"), rarefy = 10000) %>% 
+  dplyr::select(Sample_Name, Sample_ID, rep, EXT_conc, LIB_conc, Platform, RawReads) %>%
+  mutate(LIB_conc = round(LIB_conc, 1),
+         EXT_conc = round(EXT_conc, 1)) %>%
+  arrange(Sample_ID)
+
+colnames(stats_platform) <- c("Sequencing\nID", "Sample\nName", "Sampling\nLocation", "Extraction\nConc. [ng/uL]", "Library\nConc. [ng/uL]", "Platform", "No.\nmapped reads")
+
+
+tt2 <- ttheme_default(core=list(fg_params=list(hjust=1,
+                                                          x = 0.95,
+                                                          fontsize = 6)),
+                      colhead=list(fg_params=list(fontsize = 8)))
+
+grid.table(stats_platform[,1:7], rows= NULL, theme = tt2)
+```
+\pagebreak
+Sample 02 has the highest Illumina read count and will be subsampled to estimate sampling variance
+
+
+### Heatmap, cluster platform comparison
+```{r compar_platform_heatmap_cluster, warning=F, message=F, fig.width=7, fig.height=5.7, fig.align='center', echo=T, fig.cap="\\label{fig:compar_plat_heatmap}Overview of the 20 most abundant genera in the platform comparison experiment (V1-3)"}
+
+amp_heatmap(d_amp_clust2_tree_r,
+            group_by = c("rep"),
+            facet_by = "Platform",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 30,
+            #color_vector = c("blue","white", "red3"),
+            plot_values_size = 2, textmap=F) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom")
+```
+
+\pagebreak
+
+
+### PCOA plot, platform comparison
+PCOA, platform comparison, clustered
+```{r compar_platform_PCOA_clust, warning=F, message=F, eval=T, echo=T, fig.height = 6,fig.width = 6, fig.align='center'}
+amp_ordinate(d_amp_clust2_tree_r,
+             type = "PCOA",
+             transform = "none",
+             distmeasure = "wunifrac",
+             sample_color_by = "Platform",
+             sample_label_by = "rep",
+             sample_colorframe = "Platform"
+             #sample_colorframe_label = "Platform"
+             ) +
+  scale_color_colorblind() +
+  scale_fill_colorblind() +
+  theme(#legend.position = "bottom",
+    legend.position = "none",
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size=14),
+        legend.key.size = unit(1.5, "lines"),
+        legend.title = element_blank()) #+
+# ggsave(paste0("plots/", format(Sys.time(), "%Y-%m-%d"), "_platform_comp_PCoA_w_unifrac.png"), dpi=600, height = 7, width = 8)
+```
+
+Find difference between platforms by performing a Procrustes analysis and PROcrustean Randomization TEST (PROTEST)
+```{r warning=F, message=F, eval=T, echo=T,}
+library(vegan)
+
+pcoa_nano <- amp_ordinate(amp_subset_samples(d_amp_clust2_tree_r, Platform == "Nanopore"),
+             type = "PCOA",
+             transform = "none",
+             distmeasure = "wunifrac",
+             detailed_output = TRUE)
+
+pcoa_illu <- amp_ordinate(amp_subset_samples(d_amp_clust2_tree_r, Platform == "Illumina"),
+             type = "PCOA",
+             transform = "none",
+             distmeasure = "wunifrac",
+             detailed_output = TRUE)
+
+mds_nano <- pcoa_nano$model$vectors
+mds_illu <- pcoa_illu$model$vectors
+
+pro_platform <- procrustes(mds_illu, mds_nano, symmetric = TRUE)
+summary(pro_platform)
+
+protest(mds_illu, mds_nano, permutations = how(nperm = 999))
+
+
+## PCoA residuals
+distances_nano <- apply(mds_nano, 1, function(i){dist(rbind(i, rep(0, length(i))))}) %>% as.data.frame() %>% rownames_to_column("sample") %>% 
+  mutate(dataset = "Nanopore") %>% setNames(c("sample", "Distance", "dataset"))
+distances_nano_vec <- distances_nano %>% select(Distance) %>% unlist()
+
+distances_illu <- apply(mds_illu, 1, function(i){dist(rbind(i, rep(0, length(i))))}) %>% as.data.frame() %>% rownames_to_column("sample") %>% 
+  mutate(dataset = "Illumina") %>% setNames(c("sample","Distance", "dataset"))
+distances_illu_vec <- distances_illu %>% select(Distance) %>% unlist()
+
+replicate = rep(1:10, 2)
+distance_df <- rbind(distances_illu, distances_nano) %>% cbind(., replicate)
+b <- runif(nrow(distance_df), -0.1, 0.1)
+
+# Boxplot to compare pairs
+ggplot(distance_df, aes(dataset, Distance)) +
+  geom_boxplot(width=0.3, size=1.5, fatten=1.5, colour="grey70") +
+  geom_point(colour="red", size=2, alpha=0.5) +
+  geom_line(aes(group=replicate), colour="red", linetype="11") +
+  theme_bw()
+
+wilcox.test(Distance ~ dataset, data = distance_df, paired = TRUE, conf.level = 0.95)
+#wil_res <- wilcox.test(distances_illu_vec, distances_nano_vec, paired = TRUE)
+```
+
+
+### Jitterplot for the clustered data
+```{r compar_platform_clust_jitter, message=FALSE, warning=FALSE, fig.width=7., fig.height=5.0, fig.align='center', echo=T, fig.cap="\\label{fig:compar_plat_jitterplot}Jitter plot of the 10 most abundant genera in the platform comparison experiment"}
+
+# Create an ampvis2 boxplot and output the details to manipulate boxplot
+box1clust <- amp_boxplot(d_amp_clust2_rare,
+            group_by = "Platform",
+            tax_show = 20,
+            tax_add = "Phylum",
+            detailed_output = TRUE)
+
+# Save the data from the detailed output in a new variable - outputs 9 replicate rows for each sample for some reason
+boxdataclust <- box1clust$plot$data %>%
+  .[!duplicated(.), ]
+
+boxdataclust_pair <- inner_join(boxdataclust, d_amp_clust2_rare$metadata[,c("Sample_Name", "replicate")], by = c("Sample"="Sample_Name")) %>% 
+  group_by(Display, replicate) %>% 
+  mutate(group_text = paste0(Display, "_", replicate), Group=factor(Group)) %>% 
+  ungroup() %>% 
+  arrange(group_text) %>%  
+  mutate(paired = rep(1:(n()/2),each=2))
+
+
+# Create jitter plot
+ggplot(boxdataclust_pair, aes(x=Display, y=Abundance, color = Group)) +
+  geom_point(position = position_dodge(width = .6), alpha = 0.8, size = 2.1) +
+  scale_color_colorblind() +
+  guides(col = guide_legend(reverse = TRUE)) +
+  xlab("") +
+  ylab("Read Abundance (%)") +
+  theme_classic() +
+  theme(axis.line = element_line(),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        panel.grid.major = element_line(color = "grey90"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size=14),
+        legend.key.size = unit(1.5, "lines")
+        ) +
+  coord_flip() + 
+  scale_y_continuous(limits = c(0, 12), breaks = seq(0, 12, 1))# +
+# ggsave(paste0("plots/", format(Sys.time(), "%Y-%m-%d"), "_platform_jitterplot-lib4.png"), dpi = 600, height = 7, width = 10)
+```
+
+Species level variance
+```{r compar_platform_clust_sp_jitter, message=FALSE, warning=FALSE, fig.width=7., fig.height=5.0, fig.align='center', echo=T, fig.cap="\\label{fig:compar_plat_jitterplot}Jitter plot of the 10 most abundant genera in the platform comparison experiment"}
+
+# Create an ampvis2 boxplot and output the details to manipulate boxplot
+box1clust_sp <- amp_boxplot(d_amp_clust2_rare,
+            group_by = "Platform",
+            tax_show = 20,
+            tax_aggregate = "Species",
+            tax_add = "Genus",
+            detailed_output = TRUE)
+
+# Save the data from the detailed output in a new variable - outputs 9 replicate rows for each sample for some reason
+boxdataclust_sp <- box1clust_sp$plot$data %>%
+  .[!duplicated(.), ]
+
+boxdataclust_pair_sp <- inner_join(boxdataclust_sp, d_amp_clust2_rare$metadata[,c("Sample_Name", "replicate")], by = c("Sample"="Sample_Name")) %>% 
+  group_by(Display, replicate) %>% 
+  mutate(group_text = paste0(Display, "_", replicate), Group=factor(Group)) %>% 
+  ungroup() %>% 
+  arrange(group_text) %>%  
+  mutate(paired = rep(1:(n()/2),each=2))
+
+
+# Create jitter plot
+ggplot(boxdataclust_pair_sp, aes(x=Display, y=Abundance, color = Group)) +
+  geom_point(position = position_dodge(width = .6), alpha = 0.8, size = 2.1) +
+  scale_color_colorblind() +
+  guides(col = guide_legend(reverse = TRUE)) +
+  xlab("") +
+  ylab("Read Abundance (%)") +
+  theme_classic() +
+  theme(axis.line = element_line(),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        panel.grid.major = element_line(color = "grey90"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size=14),
+        legend.key.size = unit(1.5, "lines")
+        ) +
+  coord_flip() + 
+  scale_y_continuous(breaks = seq(0, 10, 1)) #+
+# ggsave(paste0("plots/", format(Sys.time(), "%Y-%m-%d"), "_platform_jitterplot_species-lib4.png"), dpi = 600, height = 7, width = 10)
+```
+
+\pagebreak

@@ -1,0 +1,360 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+### Process data for library variance
+Find Illumina samples, quality filter and merge reads.
+```{bash, eval=F}
+sh seqdata/illumina/lib5/process_illumina-samples.sh
+```
+
+
+Map raw reads to clustered MiDAS 3.7
+```{bash, eval=F}
+# Map reads to 99% clustered MiDAS 3 using minimap2
+bash illumina_mapping_99clust.sh
+```
+
+
+## Further processing in R
+
+Define function for processing loaded data in R
+```{r warning=F, message=F, echo=T}
+process_midas3clust_minimap <- function(x) {
+  barcode <- sub("barcode=", "\\1", x$barcode)
+  if (any(colnames(x) %in% "read_time")){
+    read_time <- sub(".*T(.*?)Z", "\\1", x$read_time)
+    read_date <- sub("(.*?)T.*", "\\1", x$read_time)
+    read_datetime <- as.POSIXct(paste(read_date, read_time), format = "%Y-%m-%d %H:%M:%S")
+  }else{
+    read_datetime = NA
+  }
+  otu <- x$otu
+  readID <- x$readID
+  Qr <- as.numeric(x$Qlen)/as.numeric(x$alnlen)
+  MapID <- x$MapID %>% as.numeric()
+  Qlen <- x$Qlen %>% as.numeric()
+  alnlen <- x$alnlen %>% as.numeric()
+  alnscore <- x$alnscore %>% gsub(".*:", "", .) %>% as.integer()
+  if (any(colnames(x) %in% "Platform")){
+    Platform <- as.factor(x$Platform)
+    x_d <- data.table(readID, barcode, read_datetime, otu, Qr, Qlen, alnlen, MapID, alnscore, Platform)
+  }else{
+    x_d <- data.table(readID, barcode, read_datetime, otu, Qr, Qlen, alnlen, MapID, alnscore)
+  }
+  return(x_d)
+}
+```
+
+
+#### Find spatial (biological) variance for the 10 Illumina lib4 samples
+```{r warning=F, message=F, fig.width=7, fig.height=5.7, fig.align='center', echo=T}
+il_amp_lib4 <- amp_subset_samples(d_amp_il_lib4_rare, Platform == "Illumina")
+
+taxcount_il_lib4 <- levels(as.factor(il_amp_lib4$tax$OTU)) %>% length()
+
+# Create an ampvis2 boxplot and output the details to manipulate boxplot
+box_il_lib4 <- amp_boxplot(il_amp_lib4,
+            #group_by = "Investigator",
+            #tax_aggregate = "OTU",
+            tax_aggregate = "OTU",
+            tax_show = taxcount_il_lib4,
+            #tax_add = "Phylum",
+            detailed_output = TRUE,normalise = F)
+
+# Save the data from the detailed output in a new variable - outputs 9 replicate rows for each sample for some reason
+box_il_lib4_2 <- box_il_lib4$plot$data %>% 
+  .[!duplicated(.), ]
+
+
+bio_var <- box_il_lib4_2 %>% 
+  group_by(Display) %>% 
+  summarise(Mean = mean(Abundance),
+            SD = sd(Abundance),
+            CV = sd(Abundance)/mean(Abundance)*100,
+            error = qnorm(0.975)*(SD/sqrt(10)),
+            ci_lower = Mean-error,
+            ci_upper = Mean+error) %>% 
+  mutate(Variance = "Spatial") # Previously "Biological sampling"
+```
+
+
+#### Find extraction variance for the 10 Illumina lib3 samples
+```{r warning=F, message=F, fig.width=7, fig.height=5.7, fig.align='center', echo=T, fig.cap="\\label{fig:compar_plat_species_var}SD CI as function of mean OTU count"}
+il_amp_lib3 <- amp_subset_samples(d_amp_il_lib3_rare, Platform == "Illumina")
+taxcount_il_lib3 <- levels(as.factor(il_amp_lib3$tax$OTU)) %>% length()
+
+# Create an ampvis2 boxplot and output the details to manipulate boxplot
+box_il_lib3 <- amp_boxplot(il_amp_lib3,
+            #tax_aggregate = "OTU",
+            tax_aggregate = "OTU",
+            tax_show = taxcount_il_lib3,
+            detailed_output = TRUE,normalise = F)
+
+# Save the data from the detailed output in a new variable - outputs 9 replicate rows for each sample for some reason
+box_il_lib3_2 <- box_il_lib3$plot$data %>% 
+  .[!duplicated(.), ]
+
+
+ext_var <- box_il_lib3_2 %>% 
+  group_by(Display) %>% 
+  summarise(Mean = mean(Abundance),
+            SD = sd(Abundance),
+            CV = sd(Abundance)/mean(Abundance)*100,
+            error = qnorm(0.975)*(SD/sqrt(10)),
+            ci_lower = Mean-error,
+            ci_upper = Mean+error) %>% 
+  mutate(Variance = "Extraction")
+```
+
+
+#### Find library variance for the 10 Illumina lib5 samples
+Load and process data for use in ampvis2
+```{r lib5_proc, warning=F, message=F, fig.width=7, fig.height=5.7, fig.align='center', echo=T}
+d_il_clust_lib5 <- fread("data/minimap_libvar_vs_midas36_99clust.txt", header = FALSE, sep = "\t") %>% setNames(., c("readID", "add_info", "V3")) %>% separate(add_info, c("barcode", "SAMflag", "otu", "Qlen", "alnlen", "MapID","NMtag", "alnscore", "MinimapID"), " ") %>% select(-V3)
+
+d_il_clust2_lib5 <- d_il_clust_lib5 %>% mutate(Platform = "Illumina") %>% process_midas3clust_minimap() %>% subset(., !(barcode %in% c("1:N:0:AATCAGTC+GTATCTGC", "1:N:0:AATCAGTC+CGAGGGAA"))) %>% subset(., MapID > 0.85 & Qlen > 420 & Qlen < 540 & alnlen > 420 & alnlen < 540 & Qr > 0.9 & Qr < 1.1)
+
+metadata_lib5 <- readxl::read_excel("data/metadata_merged.xlsx", col_names = TRUE) %>% as.data.frame() %>% subset(project %in% c("lib_var")) %>% arrange(Sample_ID)
+OTUcounts_il_lib5 <- d_il_clust2_lib5 %>% group_by(barcode, otu) %>% summarise(count =n())
+
+
+otutable_il_lib5 <- dcast(data = OTUcounts_il_lib5,formula = otu~barcode, value.var = "count") %>% dplyr::rename("RefESV" = otu)
+otutable_il_lib5[is.na(otutable_il_lib5)] <- 0
+
+# Rename samples
+names_lib5 <- c(RefESV = "RefESV",
+             IL_libvar_MHA_01 = "1:N:0:GGAGACAA+GCGATATA",
+             IL_libvar_MHA_02 = "1:N:0:GGAGACAA+AGTCGTGC",
+             IL_libvar_MHA_03 = "1:N:0:GGAGACAA+GTATCTGC",
+             IL_libvar_MHA_04 = "1:N:0:GGAGACAA+CGAGGGAA",
+             IL_libvar_MHA_05 = "1:N:0:GGAGACAA+CAAATTCG",
+             IL_libvar_MHA_06 = "1:N:0:GGAGACAA+AGATTGAC",
+             IL_libvar_MHA_07 = "1:N:0:GGAGACAA+AGTTACGA",
+             IL_libvar_MHA_08 = "1:N:0:GGAGACAA+GCATATGC",
+             IL_libvar_MHA_09 = "1:N:0:AATCAGTC+GCGATATA",
+             IL_libvar_MHA_10 = "1:N:0:AATCAGTC+AGTCGTGC")
+
+otutable_il_lib5_rename <- select(otutable_il_lib5, !!names_lib5) %>% dplyr::rename("query" = RefESV)
+
+otutable_il_lib5_wTAX <- inner_join(otutable_il_lib5_rename, midas3_clusttax, by = "query") %>% dplyr::rename("OTU" = query) %>% select(-RefESV)
+otutable_il_lib5_wTAX <- otutable_il_lib5_wTAX[rowSums(otutable_il_lib5_wTAX[,2:11]) > 0, ]
+colnames(otutable_il_lib5_wTAX)[2:11] <- as.character(metadata_lib5[1:10,1])
+
+d_amp_il_lib5 <- amp_load(otutable = otutable_il_lib5_wTAX, metadata = metadata_lib5)
+
+set.seed(42)
+d_amp_il_lib5_rare <- d_amp_il_lib5
+min_reads_il_lib5 <- lapply(unique(d_amp_il_lib5$abund), sum) %>% plyr::ldply() %>%
+ select(V1) %>%
+ min()
+
+# Despite the high minimum read count, to compare the datasets and variance, rarefy to minimum read count of the datasets - library 3 (extraction)
+d_amp_il_lib5_rare$abund <- as.data.frame(t(vegan::rrarefy(t(d_amp_il_lib5_rare$abund), min_reads_il_lib3))) # Rarefy to min reads
+```
+
+Stats
+```{r lib5_stats, warning=F, message=F, fig.width=7, fig.height=5.7, fig.align='center', echo=T}
+stats_lib5 <- d_amp_il_lib5 %>%
+  amp_alphadiv(measure = c("observed", "shannon"), rarefy = 10000) %>% 
+  dplyr::select(Sample_Name, Sample_ID, rep, EXT_conc, LIB_conc, RawReads) %>%
+  mutate(LIB_conc = round(LIB_conc, 1),
+         EXT_conc = round(EXT_conc, 1)) %>%
+  arrange(Sample_ID)
+
+colnames(stats_lib5) <- c("Sequencing\nID", "Sample\nName", "Sampling\nLocation", "Extraction\nConc. [ng/uL]", "Library\nConc. [ng/uL]", "No.\nmapped reads")
+
+
+tt2 <- ttheme_default(core=list(fg_params=list(hjust=1,
+                                                          x = 0.95,
+                                                          fontsize = 6)),
+                      colhead=list(fg_params=list(fontsize = 8)))
+
+grid.table(stats_lib5[], rows= NULL, theme = tt2)
+```
+
+
+Find variation
+```{r lib5_var, warning=F, message=F, fig.width=7, fig.height=5.7, fig.align='center', echo=T}
+# Calculate variation
+il_amp_lib5 <- amp_subset_samples(d_amp_il_lib5_rare, Platform == "Illumina")
+taxcount_il_lib5 <- levels(as.factor(il_amp_lib5$tax$OTU)) %>% length()
+
+# Create an ampvis2 boxplot and output the details to manipulate boxplot
+box_il_lib5 <- amp_boxplot(il_amp_lib5,
+            #tax_aggregate = "OTU",
+            tax_aggregate = "OTU",
+            tax_show = taxcount_il_lib5,
+            detailed_output = TRUE,normalise = F)
+
+# Save the data from the detailed output in a new variable - outputs 9 replicate rows for each sample for some reason
+box_il_lib5_2 <- box_il_lib5$plot$data %>% 
+  .[!duplicated(.), ]
+
+
+lib_var <- box_il_lib5_2 %>% 
+  group_by(Display) %>% 
+  summarise(Mean = mean(Abundance),
+            SD = sd(Abundance),
+            CV = sd(Abundance)/mean(Abundance)*100,
+            error = qnorm(0.975)*(SD/sqrt(10)),
+            ci_lower = Mean-error,
+            ci_upper = Mean+error) %>% 
+  mutate(Variance = "Library")
+```
+
+
+#### Find sequencing depth variance (data subsampling)
+Illumina sample 02 from the biological sampling dataset (113k reads) will be subsampled 10 times (10k reads)
+```{r message=FALSE, warning=FALSE}
+# How many reads should be sampled in each loop
+samcount <- 10000
+
+## Rarefaction approach
+il_sample_select <- amp_subset_samples(d_amp_il_lib4, Sample_ID == "IL_plat_MHA_02") ### SELECT sample with most reads
+ 
+loop_amp_df <- data.frame(Display = factor(), Sample = character(), Abundance = numeric(), Group = factor(), loopno = integer())
+
+for (i in seq(1,10)){
+  set.seed(i)
+  d_il_select_loop <- il_sample_select
+  # Rarefy to 10k reads
+  d_il_select_loop$abund <- as.data.frame(base::t(vegan::rrarefy(base::t(d_il_select_loop$abund), samcount)))
+  taxcount_var_amp <- levels(as.factor(d_il_select_loop$tax$OTU)) %>% length()
+  box_var_amp <- amp_boxplot(d_il_select_loop,
+            tax_aggregate = "OTU",
+            #tax_aggregate = "Genus",
+            tax_show = taxcount_var_amp,
+            detailed_output = TRUE,normalise = F)
+  box_var_amp2 <- box_var_amp$plot$data %>% 
+  .[!duplicated(.), ]
+  box_var_amp2$loopno <- i
+  loop_amp_df <- rbind(loop_amp_df, box_var_amp2)
+}
+
+sam_var_amp <- loop_amp_df %>% 
+  group_by(Display) %>% 
+  summarise(Mean = mean(Abundance),
+            SD = sd(Abundance),
+            CV = sd(Abundance)/mean(Abundance)*100,
+            error = qnorm(0.975)*(SD/sqrt(10)),
+            ci_lower = Mean-error,
+            ci_upper = Mean+error) %>% 
+  mutate(Variance = "Seq. depth")
+```
+
+
+## Plots
+
+Plot variance data - only taxonomic clusters that are observed at least 1 time (mean) is shown, and maximum 1000 times (mean). All datasets (except for data subsampling) are rarefied to `r min_reads_il_lib3` reads.
+```{r message=FALSE, warning=FALSE}
+all_var <- rbind(bio_var, ext_var, lib_var, sam_var_amp)
+
+all_var$Variance <- factor(all_var$Variance, levels = c("Spatial", "Extraction", "Library", "Seq. depth"))
+all_var_tax <- inner_join(all_var, midas3_clusttax, by = c("Display" = "query"))
+
+# Horizontal lines are added to find the biological sampling coefficient of variation for mean counts of 10, 100 and 1000.
+#p1 <- 
+  ggplot(all_var, aes(x = Mean, y = CV, color = Variance, group = Variance)) +
+  geom_point(size = 1, alpha = 0.3) +
+  geom_smooth(se = F, size = 1) +
+  scale_x_log10(limits = c(1, 2000), breaks = c(1, 10, 100, 1000, 2000), labels = c(1, 10, 100, 1000, 2000)) +
+  scale_y_continuous(limits = c(0, 150), breaks = c(0, 10, 20, 50, 100, 150)) +
+  geom_segment(aes(x = 100, y = 33.2, xend = 100, yend = 15.9), linetype = "dashed", color = "darkred") + # spatial variance at x=100
+  geom_segment(aes(x = 100, y = 15.9, xend = 100, yend = 12), linetype = "dashed", color = "#e6550d") + # ext variance at x=100
+  geom_segment(aes(x = 100, y = 12, xend = 100, yend = 9.4) ,linetype = "dashed", color = "darkred") + # lib variance at x=100
+  geom_segment(aes(x = 100, y = 9.4, xend = 100, yend = 0), linetype = "dashed", color = "#e6550d") + # seq variance at x=100
+  annotate("text", label = "52%", x = 89, y = ((33.2-15.9)/2)+15.9, size = 5, color = "darkred", alpha = 0.8) +
+  annotate("text", label = "12%", x = 89, y = ((15.9-12)/2)+12, size = 5, color = "darkred", alpha = 0.8) +
+  annotate("text", label = "8%", x = 89, y = ((12-9.4)/2)+9.4, size = 5, color = "darkred", alpha = 0.8) +
+  annotate("text", label = "28%", x = 89, y = (9.4/2), size = 5, color = "darkred", alpha = 0.8) +
+  geom_segment(aes(x = 10, y = 46.55, xend = 10, yend = 34.75), linetype = "dashed", color = "darkred") + # spatial variance at x=10
+  geom_segment(aes(x = 10, y = 34.75, xend = 10, yend = 32.6), linetype = "dashed", color = "#e6550d") + # ext variance at x=10
+  geom_segment(aes(x = 10, y = 32.6, xend = 10, yend = 29.35) ,linetype = "dashed", color = "darkred") + # lib variance at x=10
+  geom_segment(aes(x = 10, y = 29.35, xend = 10, yend = 0), linetype = "dashed", color = "#e6550d") + # seq variance at x=10
+  annotate("text", label = "25%", x = 12.1, y = ((46.55-34.75)/2)+34.75, size = 5, color = "darkred", alpha = 0.8) +
+  annotate("text", label = "5%", x = 12.1, y = ((34.75-32.6)/2)+32.6-1, size = 5, color = "darkred", alpha = 0.8) +
+  annotate("text", label = "7%", x = 12.1, y = ((32.6-29.35)/2)+29.35-2, size = 5, color = "darkred", alpha = 0.8) +
+  annotate("text", label = "63%", x = 12.1, y = (29.35/2), size = 5, color = "darkred", alpha = 0.8) +
+  xlab("Mean read count") +
+  ylab("Coefficient of variation [%]") +
+  scale_fill_manual(name = "Variance") +
+  theme(text = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 10, color = "black"),
+        axis.text.y = element_text(hjust = 1),
+        plot.margin = unit(c(0,0,0,0), "mm"),
+        axis.line = element_line(color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey95"),
+        axis.ticks = element_line(color = "black"),
+        axis.ticks.length = unit(1, "mm"),
+        panel.background = element_blank(),
+        legend.position = c(0.8, 0.8),
+        legend.background = element_rect(fill = "white", linetype = "solid", color = "black")
+        ) +
+  coord_cartesian(ylim = c(0, 105))#  +
+  # ggsave(filename= paste0("plots/",format(Sys.Date(), "%Y-%m-%d"),"_variation_comp-all_crop-99clust.png"), width = 9, height = 6.5, dpi = 600)
+
+# plotly::ggplotly(p1)
+
+# For a mean count of 10, the coefficient of variation (biological) is 46.5. SD is calculated by SD = CV/100*mean(abundance). The relative abundance is 0.03% (10/min_reads_il_lib3*100)
+#46.5/100*10
+# For a mean count of 100, the coefficient of variation (biological) is 32.8 The relative abundance at 100 reads is 0.33
+#32.8/100*100
+# For a mean count of 1000, the coefficient of variation (biological) is 30.9. The relative abundance at 1000 reads is 3.33
+#30.9/100*1000
+
+## 100 reads
+(33.2-15.9)/33.2*100 # spatial sampling variance accounts for x% of the total variation
+(15.9-12)/33.2*100 # extraction variance accounts for x% of the total variation
+(12-9.4)/33.2*100 # library variance accounts for x% of the total variation
+9.4/33.2*100 # seq depth variance is x% of the total variation
+
+## 10 reads
+(46.55-34.75)/46.55*100 # spatial sampling variance accounts for x% of the total variation
+(34.75-32.6)/46.55*100 # extraction variance accounts for x% of the total variation
+(32.6-29.35)/46.55*100 # library variance accounts for x% of the total variation
+29.35/46.55*100 # seq depth variance is x% of the total variation
+```
+
+With taxonomy overlay (Genus)
+```{r message=FALSE, warning=FALSE}
+p1 <- ggplot(all_var_tax, aes(x = Mean, y = CV, color = Genus, group = Variance)) +
+  geom_point(size = 1, alpha = 0.3) +
+  geom_smooth(se = F, size = 1) +
+  scale_x_log10(limits=c(1,2000), breaks = c(1, 10, 100, 1000, 2000), labels = c(1, 10, 100, 1000, 2000)) +
+  scale_y_continuous(limits=c(0,150), breaks = c(0, 10, 20, 50, 100, 150)) +
+  xlab("Mean count") +
+  ylab("SD as % of mean count") +
+  geom_hline(aes(yintercept=32.8, linetype = "dashed", color = "darkred")) +
+  geom_hline(aes(yintercept=46.5, linetype = "dashed", color = "darkred")) +
+  geom_hline(aes(yintercept=30.9, linetype = "dashed", color = "darkred")) +
+  #geom_vline(x=10, linetype = "dashed", color = "darkred") +
+  theme(#legend.position = "none",
+        text = element_text(size = 8, color = "black"),
+        axis.text = element_text(size = 8, color = "black"),
+        axis.text.y = element_text(hjust = 1),
+        plot.margin = unit(c(0,0,0,0), "mm"),
+        axis.line = element_line(color = "black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey95"),
+        axis.ticks = element_line(color = "black"),
+        axis.ticks.length = unit(1, "mm"),
+        panel.background = element_blank()
+        ) +
+  coord_cartesian(ylim = c(0, 105))
+plotly::ggplotly(p1)
+```
+
+
+The genera located in the (100,50)-(1000,100) quadrant are:
+- d:Bacteria,p:Actinobacteria,c:Acidimicrobiia,o:Microtrichales,f:Microtrichaceae,g:Ca_Microthrix (Gram-positive)
+- d:Bacteria,p:Epsilonbacteraeota,c:Campylobacteria,o:Campylobacterales,f:Arcobacteraceae,g:Arcobacter (Gram-negative)
+- d:Bacteria,p:Proteobacteria,c:Gammaproteobacteria,o:eub62A3,f:midas_f_1324,g:midas_g_1324 (Gram-negative)
+- midas2_K2-30-37
+- d:Bacteria,p:Bacteroidetes,c:Bacteroidia,o:Sphingobacteriales,f:Lentimicrobiaceae,g:midas_g_1061 (Gram-negative)
+- d:Bacteria,p:Bacteroidetes,c:Bacteroidia,o:Sphingobacteriales,f:env.OPS_17,g:midas_g_3838
+- d:Bacteria,p:Bacteroidetes,c:Ignavibacteria,o:SJA-28,f:midas_f_31,g:midas_g_171
+
+Seems like it is not bad extraction based on Gram-type. It could be the biomass sampling that gives such high CV%.

@@ -1,0 +1,101 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Different bead beating seettings have been compared to determine the usability of the handheld bead beater and the optimal bead beating time for lysis.
+
+Load data
+```{r bb_load, message=F, warning=F, echo=T}
+# Illumina data for the bead beater analysis, standard V1-3 OTU clustering
+otutable_bb <- read_delim("data/bead_beater/bV1V3_midas33/otutable.txt", col_names = TRUE, delim = "\t")
+
+metadata_bb <- readxl::read_excel("data/metadata_merged.xlsx", col_names = TRUE) %>% as.data.frame() %>% subset(project %in% c("bead_beater")) # Metadata for the bead beater analysis
+
+# Create ampvis object
+d_bb <- amp_load(otutable = otutable_bb, metadata = metadata_bb) %>% amp_subset_samples(.,!(rep %in% c("neg", "pos")))
+
+# Set seed for analysis to enable reproducibility
+set.seed(42L)
+
+d_bb_rare <- d_bb
+min_reads_bb <- lapply(unique(d_bb_rare$abund), sum) %>% plyr::ldply() %>%
+  select(V1) %>%
+  min()
+
+d_bb_rare$abund <- as.data.frame(base::t(vegan::rrarefy(base::t(d_bb_rare$abund), min_reads_bb))) # Rarefy to min reads (?k)
+```
+
+
+### Stats for the lysis analysis
+Sequencing statistics for the lysis analysis (Table \ref{fig:bb_stats}). The sequencing data were clustered into OTUs and reads were mapped to them using usearch7. OTUs were classified to MiDAS v.3.7 using using the rdp classifier.
+```{r bb_stats, warning=F, message=F, echo=T, fig.height=3.7, fig.align='center', fig.cap="\\label{fig:bb_stats}Lysis sequencing stats"}
+stats <- d_bb %>%
+  amp_alphadiv(measure = c("observed", "shannon"), rarefy = 10000) %>%
+  select(Sample_Name, Sample_ID, EXT_conc, LIB_conc, RawReads, ObservedOTUs, Shannon) %>%
+  mutate(LIB_conc = round(LIB_conc, 1),
+         EXT_conc = round(EXT_conc, 1),
+         Shannon = round(Shannon, 1)) %>%
+  arrange(Sample_Name)
+
+colnames(stats) <- c("Sequencing\nID", "Sample\nName", "Extraction\nConc. [ng/uL]", "Library\nConc. [ng/uL]", "Reads", "Observed\nOTUs", "Shannon\nIndex")
+
+
+tt2 <- ttheme_default(core=list(fg_params=list(hjust=1,
+                                                          x = 0.95,
+                                                          fontsize = 6)),
+                      colhead=list(fg_params=list(fontsize = 8)))
+
+grid.table(stats, rows= NULL, theme = tt2)
+```
+\pagebreak
+
+
+### Heatmap, lysis analysis
+```{r compar_bead_heatmap, warning=F, message=F, eval = T, fig.width=7, fig.height=5.7, fig.align='center', echo=T, fig.cap="\\label{fig:compar_bb_heatmap}Overview of the 20 most abundant genera in the lysis experiment"}
+ch_vector <- as.character(d_bb_rare$metadata$SampleID)
+
+d_bb_rare$metadata <- mutate_at(d_bb_rare$metadata, "Lysis_time", factor, levels = c("5s", "15s", "30s", "2x30s", "Reference"))
+amp_heatmap(d_bb_rare,
+            group_by = "Sample_ID",
+            facet_by = "Lysis_time",
+            order_x_by = ch_vector,
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            color_vector = c("blue","white", "red3"),
+            tax_show = 20,
+            plot_na= T,
+            plot_values = T,
+            tax_empty = "best",
+            min_abundance = 0.1,
+            max_abundance = 15,
+            plot_values_size = 2
+            ) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom") #+
+#  ggsave("plots/lysis_heatmap_midas33.png", width = 9, height = 7, dpi = 600)
+```
+The reference samples (extracted as recommended by [Albertsen et al. 2015](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0132783)), which underwent 4x40s bead beating, were processed on the FastPreP-24 (MP BIO), while the other samples were processed on the SuperFastPrep-1 (MP BIO). Samples which underwent more than one cycle of bead beating were left on ice for 2 minutes between cycles. Sample IL_BB_09 is an outlier, likely due to a sampling bias during DNA extraction.. Some bacteria are easier to lyse than others, where a genus such as Rhodoferax is the most abundant after 5s and decreasing in relative abundance when bead beating more. The Gram-positive Tetrasphaera is hardly present after 5s bead beating, but is among the 5 most abundant after 2x30s and 4x40s of bead beating.
+\pagebreak
+
+
+### PCA, lysis analysis
+```{r compar_bead_PCA, warning=F, message=F, eval = T, fig.height = 6,fig.width = 6, fig.align='center', echo=T, fig.cap="\\label{fig:compar_bb_PCA}Principal component analysis of the microbial compositions in the lysis experiment (Illumina V1-3 sequenced)"}
+d_bb_sub <- d_bb_rare %>% amp_subset_samples(.,!(Sample_ID %in% c("IL_BB_09")))
+amp_ordinate(d_bb_sub,
+             type = "PCA",
+             transform = "Hellinger",
+             sample_color_by = "Lysis_time",
+             sample_colorframe = "colorframe",
+             sample_colorframe_label = "Lysis_time",
+             sample_label_size = 9,
+             repel_labels = F) +
+  theme(legend.position = "none",
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14)) #+
+#  ggsave(paste0("plots/", format(Sys.time(), "%Y-%m-%d"), "_lysis_PCA_midas33.png"), width = 8, height = 8, dpi = 600)
+```
+Sample IL_BB_09 has been excluded from the colorframe due to the possible sampling bias. Based on the PCA it appears that the observed microbial communities become more similar with increased bead beating, where the community changes noticeably between 30s and 2x30s, but not as much if bead beating is increased to 4x40s.
+\pagebreak

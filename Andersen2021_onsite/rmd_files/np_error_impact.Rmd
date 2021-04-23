@@ -1,0 +1,405 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+### Initial steps
+Firstly, extract sequences from the Clostridiales order, which will be used as a small control database. The ESVs are identified in the MiDAS 3.7 database
+```{bash, eval=F}
+grep 'Clostridiales.*' db/midas37/midas37_single.fa > mappings/Clostridiales_order.list
+```
+
+And extracted to a fasta file
+```{bash, eval=F}
+cat mappings/Clostridiales_order.list | \
+  tr -d '>' | \
+  seqtk subseq db/midas37/midas37_single.fa - > mappings/Clostridiales_order.fa
+```
+
+Cluster, align and create tree. The sequences are often very similar, so to remove some of the diversity the data are clustered to 99%
+```{bash, eval=F}
+vsearch --cluster_fast mappings/Clostridiales_order.fa --id 0.99 --centroids mappings/Clostridiales_order_99clust.fa
+```
+
+Create alignment of clustered sequences
+```{bash, eval=F}
+mafft --thread 10 mappings/Clostridiales_order_99clust.fa > mappings/clostridiales_clust_align.aln
+```
+
+Fix taxonomy in alignment, as the MiDAS 3.7 taxonomy will not work in the tree
+```{bash, eval=F}
+sed 's,;,+,g' mappings/clostridiales_clust_align.aln > mappings/clostridiales_clust_align_fix.aln
+sed 's,\,,_,g' -i mappings/clostridiales_clust_align_fix.aln
+sed 's,tax=d:,,g' -i mappings/clostridiales_clust_align_fix.aln
+sed 's,p:,,g' -i mappings/clostridiales_clust_align_fix.aln
+sed 's/.://g' -i mappings/clostridiales_clust_align_fix.aln
+```
+
+Make a tree from the alignment
+```{bash, eval=F}
+fasttreeMP -nt mappings/clostridiales_clust_align_fix.aln > mappings/clostridiales_clust99_tree.newick
+```
+
+
+### Simulate reads
+Choose one ESV and extract sequence
+```{bash, eval=F}
+grep -A1 'FLASV8259.1452' db/midas37/midas37_single.fa > mappings/clostridiales_esv.fa
+```
+
+The chosen ESV (FLASV8259.1452 with tax Bacteria,p:Firmicutes,c:Clostridia,o:Clostridiales,f:Lachnospiraceae,g:Blautia,s:Blautia_wexlerae) is used for the following analyses. Nanopore errors were introduced using [Badread](https://github.com/rrwick/Badread), using settings "--quantity 25000x --error_model nanopore --qscore_model nanopore --identity 92,100,4 --seed 42". The simulated reads are mapped to the real sequence to identify which reads were generated successfully (>85% identity)
+
+
+QC: Check read lengths of simulated data
+```{bash, eval=F}
+# Median - https://stackoverflow.com/questions/6166375/median-of-column-with-awk
+cat seqdata/nanopore/deepsim/clostridiales-2k-906-meanID.fastq | awk '{if(NR%4==2) print length($1)}' | sort -nk 1 | awk '{
+    count[NR] = $1;
+}
+END {
+    if (NR % 2) {
+        print count[(NR + 1) / 2];
+    } else {
+        print (count[(NR / 2)] + count[(NR / 2) + 1]) / 2.0;
+    }
+}'
+
+# Mean
+cat seqdata/nanopore/deepsim/clostridiales-2k-906-meanID.fastq | awk '{if(NR%4==2) print length($1)}' | sort -nk 1 | awk '{ sum += $1; n++ } END { if (n > 0) print sum / n; }'
+
+# Minimum
+cat seqdata/nanopore/deepsim/clostridiales-2k-906-meanID.fastq | awk '{if(NR%4==2) print length($1)}' | sort -nk 1 | head -n 1
+
+# Maximum
+cat seqdata/nanopore/deepsim/clostridiales-2k-906-meanID.fastq | awk '{if(NR%4==2) print length($1)}' | sort -nk 1 | tail -n 1
+```
+Median of 1507, minimum of 344 and max of 1558
+
+### Map real sequence and simulated reads to LCO databases
+Remove taxonomic levels (Leave-Clade-Out - LCO) from MiDAS 3.7
+```{bash, eval=F}
+# Species
+sed '/s:Blautia_wexlerae/,+1d' db/midas37/midas37_single.fa > db/midas37-mod/blautia-midas37-species-filt.fa
+# Genus
+sed '/g:Blautia/,+1d' db/midas37/midas37_single.fa > db/midas37-mod/blautia-midas37-genus-filt.fa
+# Family
+sed '/f:Lachnospiraceae/,+1d' db/midas37/midas37_single.fa > db/midas37-mod/blautia-midas37-family-filt.fa
+# Order
+sed '/o:Clostridiales/,+1d' db/midas37/midas37_single.fa > db/midas37-mod/blautia-midas37-order-filt.fa
+# Class
+sed '/c:Clostridia/,+1d' db/midas37/midas37_single.fa > db/midas37-mod/blautia-midas37-class-filt.fa
+# Phylum
+sed '/p:Firmicutes/,+1d' db/midas37/midas37_single.fa > db/midas37-mod/blautia-midas37-phylum-filt.fa
+# Domain
+sed '/d:Bacteria/,+1d' db/midas37/midas37_single.fa > db/midas37-mod/blautia-midas37-domain-filt.fa
+```
+
+The simulated reads, along with the real sequence, are first mapped to the full MiDAS 3.7 database, then the species (Blautia_wexlerae) is removed and the reads are mapped again. This continues for all taxonomic levels.
+```{bash, eval=F}
+sh map_lco_simESV.sh
+```
+
+
+
+### Effect of removing taxonomic groups
+Load all mapping data into R, keep only primary mappings
+```{r message=FALSE, warning=FALSE}
+# Define function
+
+mapping_minisam <- function(x) {
+  df <- x %>% 
+    setNames(c("Query", "SAMflag", "Tax", "Qlen", "alnlen", "MapID", "NMscore", "alnscore", "minimap2ID")) %>% 
+     separate(Tax, c("RefESV", "Tax"), ";tax=") %>%
+     mutate(Tax= gsub("[a-z]:", "", Tax), Tax=gsub(";","",Tax), alnscore=as.integer(gsub(".*:", "", alnscore)), MapID = MapID*100, minimap2ID = 100-as.numeric(gsub("de:f:", "", minimap2ID))*100, Rlen = gsub(".*\\.", "", RefESV))
+  df$Qr <- as.numeric(df$Qlen)/as.numeric(df$alnlen)
+  return(df)
+}
+
+
+# Reference
+esvClost_ref_real <- fread("data/error_imp/clost_real_minimap_vs_midas37_ref.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Reference distance", Taxlevel = "Reference")
+esvClost_ref_badread <- fread("data/error_imp/clost_badread_minimap_vs_midas37_ref.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Reference")
+
+
+# Species removed
+esvClost_species_real <- fread("data/error_imp/clost_real_minimap_vs_midas37_filt_species.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Reference distance", Taxlevel = "Species")
+esvClost_species_badread <- fread("data/error_imp/clost_badread_minimap_vs_midas37_filt_species.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Species")
+
+
+# Genus removed
+esvClost_genus_real <- fread("data/error_imp/clost_real_minimap_vs_midas37_filt_genus.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Reference distance", Taxlevel = "Genus")
+esvClost_genus_badread <- fread("data/error_imp/clost_badread_minimap_vs_midas37_filt_genus.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Genus")
+
+
+# Family removed
+esvClost_family_real <- fread("data/error_imp/clost_real_minimap_vs_midas37_filt_family.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Reference distance", Taxlevel = "Family")
+esvClost_family_badread <- fread("data/error_imp/clost_badread_minimap_vs_midas37_filt_family.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Family")
+
+
+# Order removed
+esvClost_order_real <- fread("data/error_imp/clost_real_minimap_vs_midas37_filt_order.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Reference distance", Taxlevel = "Order")
+esvClost_order_badread <- fread("data/error_imp/clost_badread_minimap_vs_midas37_filt_order.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Order")
+
+
+# Class removed
+esvClost_class_real <- fread("data/error_imp/clost_real_minimap_vs_midas37_filt_class.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Reference distance", Taxlevel = "Class")
+esvClost_class_badread <- fread("data/error_imp/clost_badread_minimap_vs_midas37_filt_class.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Class")
+
+
+# Phylum removed
+esvClost_phylum_real <- fread("data/error_imp/clost_real_minimap_vs_midas37_filt_phylum.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Reference distance", Taxlevel = "Phylum")
+esvClost_phylum_badread <- fread("data/error_imp/clost_badread_minimap_vs_midas37_filt_phylum.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Phylum")
+
+
+# Domain removed
+# Nothing could map to another domain
+esvClost_domain_real <- fread("data/error_imp/clost_real_minimap_vs_midas37_filt_domain.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Reference distance", Taxlevel = "Domain")
+
+esvClost_domain_badread <- fread("data/error_imp/clost_badread_minimap_vs_midas37_filt_domain.txt", header=F, sep = " ") %>% mapping_minisam() %>% mutate(Platform = "Nanopore", Taxlevel = "Domain")
+
+
+# Create data frame and remove the redundant variables
+esvClost_df <- mget(ls(pattern = "^(esvClost_.*_real|esvClost_.*_badread)")) %>% bind_rows
+
+
+rm(list = ls(pattern = "^(esvClost_.*_real|esvClost_.*_badread.*)"))
+
+
+esvClost_df$Taxlevel <- factor(esvClost_df$Taxlevel, levels = c("Reference","Species", "Genus", "Family", "Order", "Class", "Phylum", "Domain"))
+```
+
+
+QC: Distribution of reference length/alignment length ratios for the different taxonomy levels
+```{r message=FALSE, warning=FALSE}
+library(ggridges)
+ggplot(esvClost_df, aes(x = Qr, y = Taxlevel, fill = Platform)) + geom_density_ridges2() + theme_bw() + scale_x_continuous(limits = c(0,10))
+```
+
+
+QC: Distribution of query lengths and alignment lengths for the different taxonomy levels
+```{r message=FALSE, warning=FALSE}
+esvdf <- esvClost_df %>% select(c(Platform, Taxlevel, Qlen, alnlen))%>% melt()
+
+ggplot(esvdf, aes(x = value, y = Taxlevel, fill=variable), alpha=0.25) + geom_density_ridges2(alpha=0.5) + geom_vline(xintercept = 1452, colour = "red", linetype = "longdash")+ theme_bw() + scale_x_continuous(limits = c(0,3000))
+```
+
+
+QC: Mapping identity vs alignment length
+```{r message=FALSE, warning=FALSE}
+ggplot(subset(esvClost_df, Platform == "Nanopore"), aes(x = minimap2ID, y = alnlen, color=Taxlevel)) + geom_point() + geom_hline(yintercept = 1452, colour = "red", linetype = "longdash") + theme_bw()
+```
+
+
+Subset to alignment lengths > 1200bp and query/alignment ratios in the 0.9-1.1 range (removes 7% of the data) and then randomly subset to 1000 alignments (removes 47% more, i.e. 50% of the original data are left)
+```{r message=FALSE, warning=FALSE}
+set.seed(42)
+
+esvClost_ref_qc <- esvClost_df %>% subset(Platform == "Nanopore" & Taxlevel == "Reference" & Qlen > 1200 & Qr< 1.1 & Qr > 0.9) %>% sample_n(., 1000) %>% select(Query) %>% unlist()
+
+esvClost_df_sub <- esvClost_df %>% subset(Platform == "Reference distance" | Query %in% esvClost_ref_qc)
+esvClost_df_sub$Platform <- fct_rev(esvClost_df_sub$Platform)
+```
+
+
+Check read accuracy distribution of the simulated reads, subset
+```{r message=FALSE, warning=FALSE}
+esvClost_df_sub %>% subset(Platform == "Nanopore" & Taxlevel == "Reference") %>% select(MapID) %>% summary()
+```
+
+
+QC: Mapping identity vs alignment length - sub
+```{r message=FALSE, warning=FALSE}
+ggplot(subset(esvClost_df_sub, Platform == "Nanopore"), aes(x = minimap2ID, y = alnlen, color=Taxlevel)) + geom_point() + geom_hline(yintercept = 1452, colour = "red", linetype = "longdash") + theme_bw()
+```
+
+
+Boxplot of mapping identities (full dataset)
+```{r, message=FALSE, warning=FALSE}
+stat_box_data <- function(y, upper_limit = max(esvClost_df$MapID) * 1.12) {
+  return(
+    data.frame(
+      y=0.95 * upper_limit,
+      label = paste0('c=', length(y), '\n',
+                    'm=', round(mean(y), 1), '\n')
+    )
+  )
+}
+
+ggplot(esvClost_df, aes(x=Taxlevel, y = MapID, fill = Platform)) + 
+  geom_boxplot() + 
+  stat_summary(
+    fun.data = stat_box_data,
+    geom = "text",
+    hjust = 0.5,
+    vjust = 0.9,
+    size = 3,
+    position = position_dodge(width = 0.75)
+  ) +
+  coord_cartesian(ylim = c(40, 105)) + ylab("Mapping identity [%]") + xlab("") + labs(fill = "Data set") +
+  theme_bw() + theme(panel.grid.major.x = element_blank()) + scale_y_continuous(breaks = c(40, 50, 60, 70, 80, 90, 95, 97.5, 100)) #+ ggsave("map_db_test/plots/map_mock-SMK_mapID.png", width = 17, height = 6.5, dpi = 300)
+```
+
+
+Boxplot of mapping identities (quality-filtered subset)
+```{r, message=FALSE, warning=FALSE}
+esvClost_df_sub1 <- subset(esvClost_df_sub, Taxlevel != "Domain")
+thresholds <- c(Species = 98.7, Genus = 94.5, Family = 86.5, Order = 82.0, Class = 78.5, Phylum = 75) # Based on Yarza et al. 2014
+np_error <- 9.56809
+np_thresholds <- thresholds - np_error
+
+esvClost_df_sub2 <- esvClost_df_sub1
+
+stat_box_data <- function(y, upper_limit = max(esvClost_df_sub1$MapID) * 1.12) {
+  return(
+    data.frame(
+      y=102,
+      label = paste0('c=', length(y), '\n',
+                    'm=', round(mean(y), 1), '\n')
+    )
+  )
+}
+
+ggplot(esvClost_df_sub2, aes(x=Taxlevel, y = MapID)) + 
+  geom_boxplot(aes(color = Platform)) + 
+  stat_summary(
+    aes(fill = factor(Platform)),
+    fun.data = stat_box_data,
+    geom = "text",
+    hjust = 0.5,
+    vjust = 0.9,
+    size = 4,
+    position = position_dodge(width = 0.75)
+  ) +
+  coord_cartesian(ylim = c(70, 102)) + 
+  ylab("Mapping identity [%]") + xlab("") + labs(fill = "Data set") + 
+  scale_color_manual(values = c("#FF0000", "#56B4E9")) + 
+  theme_bw() + 
+  theme(panel.grid.major.x = element_blank(),
+        legend.title = element_blank(),
+        legend.position = "bottom",
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size=14)) + 
+  scale_y_continuous(breaks = c(70, 80, 90, 95, 97.5, 100)) #+ 
+#  ggsave(paste0("plots/", format(Sys.time(), "%Y-%m-%d"), "_errorimp_map_qcsub_midas37.png"), width = 13, height = 6.8, dpi = 600)
+
+
+# Stats
+esvClost_df_sub1 %>% subset(Platform == "Nanopore") %>% select(Taxlevel, MapID) %>% split(.$Taxlevel) %>% map(summary)
+```
+
+### Taxonomy table of mapping fractions
+```{r, message=FALSE, warning=FALSE}
+np_sim_sub <- esvClost_df_sub1 %>% subset(Platform == "Nanopore")
+
+# Output a table of which ESVs are mapped to
+np_ref_seqs <- np_sim_sub %>% select(RefESV) %>% unique() %>% unlist()
+
+## Add the other ESVs in the Blautia genus, even though they are not mapped to
+np_ref_seqs1 <- append(np_ref_seqs, c("FLASV7906.1453", "FLASV8471.1452", "FLASV8813.1452", "FLASV9143.1452"), after = length(np_ref_seqs))
+
+## Write file
+# np_ref_seqs1 %>% write.table("data/error_imp/np_error_refESVs_midas37", quote = F, row.names = F, col.names = F)
+
+
+# Create a table of the fractions of reads that map to each reference (where each taxonomic database level equals 100%)
+np_taxlevs <- levels(as.factor(np_sim_sub$Taxlevel))
+tax_frac_table <- data.frame(Taxlevel = character(), Tax = character(), Fraction = numeric(), Reads = integer())
+
+for (i in seq(1, 7, 1)) {
+  select_taxlev <- np_taxlevs[i]
+  taxdf <- subset(np_sim_sub, np_sim_sub$Taxlevel == np_taxlevs[i]) %>% select(Taxlevel, Tax)
+  len_tax <- nrow(taxdf)
+  if(select_taxlev == "Reference"){
+    colindices <- 9-i
+  }else{
+  colindices <- 10-i  
+  }
+  taxdf_fix <- separate(taxdf, Tax, into = c("Domain", "Phylum", "Order", "Class", "Family", "Genus", "Species"), sep = ",") %>% select(1:colindices)
+  taxdf_fix2 <- taxdf_fix %>% unite(., Tax, 2:colindices, sep = ",")
+  taxa_list <- taxdf_fix %>% unite(., Tax, 2:colindices, sep = ",") %>% unique() %>% pull(Tax)
+  for (o in seq_along(taxa_list)) {
+    select_taxa <- taxa_list[o]
+    taxfrac <- subset(taxdf_fix2, taxdf_fix2$Tax == taxa_list[o]) %>% nrow()/len_tax*100
+    readcount <- subset(taxdf_fix2, taxdf_fix2$Tax == taxa_list[o]) %>% nrow()
+    taxloop_df <- data.frame(Taxlevel = select_taxlev, Tax = select_taxa, Fraction = taxfrac, readcount)
+    tax_frac_table <- rbind(tax_frac_table, taxloop_df)
+  }
+}
+
+# write_excel_csv(x = tax_frac_table, path = "data/error_imp/2020-09-29_error-imp-fractions-midas37.csv", col_names = T, delim = "\t")
+```
+
+
+Boxplot of alignment scores (quality-filtered subset)
+```{r, message=FALSE, warning=FALSE}
+esvClost_df_sub1 <- subset(esvClost_df_sub, Taxlevel != "Domain")
+stat_box_data2 <- function(y, upper_limit = max(esvClost_df_sub1$alnscore) * 1.12) {
+  return(
+    data.frame(
+      y=0.95 * upper_limit,
+      label = paste0('c=', length(y), '\n',
+                    'm=', round(mean(y), 1), '\n')
+    )
+  )
+}
+
+ggplot(esvClost_df_sub1, aes(x=Taxlevel, y = alnscore)) + 
+  geom_boxplot(aes(color = Platform)) + 
+   stat_summary(
+    aes(fill = factor(Platform)),
+    fun.data = stat_box_data2,
+    geom = "text",
+    hjust = 0.5,
+    vjust = 0.9,
+    size = 3.7,
+    position = position_dodge(width = 0.75)
+  ) + 
+  ylab("Alignment score") + xlab("") + scale_color_manual(values = c("#FF0000", "#56B4E9")) +
+    labs(fill = "Data set") + 
+  theme_bw() +
+  theme(panel.grid.major.x = element_blank(),
+        legend.title = element_blank(),
+        legend.position = "bottom",
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size=14)) #+ 
+# ggsave(paste0("plots/", format(Sys.time(), "%Y-%m-%d"), "_errorimp_alnscore_qcsub-midas37.png"), width = 13, height = 6.8, dpi = 600)
+```
+
+
+## Get mapping IDs for each MiDAS sequence to the Blautia ESV
+Used to evaluate identity-% between simulated ESV and other MiDAS ESVs.
+Map Blautia reference ESV to MiDAS 3.7
+```{bash, eval = F}
+usearch10 -usearch_global db/midas37/midas37_single.fa -db DeepSimulator/esvs/clostridiales_esv.fa -strand plus -id 0.5 -maxaccepts 0 -maxrejects 0 -samout mappings/midas37_vs_blautiaESV.sam -threads 40
+
+awk '$2 == 0 || $2 == 16' mappings/midas37_vs_blautiaESV.sam > mappings/midas37_vs_blautiaESV_filt.sam
+
+awk '{
+    for(i=1;i<=NF;i++){
+      if($i ~ /^NM:i:/){sub("NM:i:", "", $i); mm = $i}
+    }
+    split($6, count, /[^0-9]+/);
+    split($6, type, /[^A-Z]*/);
+    for(i=1; i<= length(count)-1; i++){
+      if(type[i + 1] ~ /[DIM]/){aln+=count[i]};
+    }
+    print $1, $2, $3, length($10), aln, (aln - mm)/aln, $12
+    aln=0;
+  }' mappings/midas37_vs_blautiaESV_filt.sam > mappings/midas37_vs_blautiaESV_filt.txt
+```
+
+Load into R
+```{r, message=FALSE, warning=FALSE}
+blautia_mapIDs <- fread("data/mappings/midas37_vs_blautiaESV_filt.txt", sep = ' ') %>% setNames(., c("Query", "SAMflag", "Reference", "Qlen", "alnlen", "MapID", "alnscore"))
+
+blautia_d <- blautia_mapIDs %>% 
+     separate(Query, c("qESV", "qTax"), ";tax=") %>%
+     mutate(qTax= gsub("[a-z]:", "", qTax), qTax=gsub(";","",qTax), alnscore=as.integer(gsub(".*:", "", alnscore)), MapID = MapID*100) %>% select(c(qESV, qTax, MapID)) %>% separate(qTax, into = c("Domain", "Phylum", "Order", "Class", "Family", "Genus", "Species"), sep = ",") %>% filter(Domain != "Archaea")
+
+blautia_d_s <- subset(blautia_d, qESV %in% np_ref_seqs1)
+
+# write.table(blautia_d_s, file = "data/Blautia_mapIDs.csv", quote = FALSE, row.names=F, col.names = F, sep = "\t")
+```

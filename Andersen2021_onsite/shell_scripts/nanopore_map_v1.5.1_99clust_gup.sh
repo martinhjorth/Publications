@@ -15,10 +15,15 @@ module load SAMtools/1.10-foss-2018a
 #
 ###################################################################################################
 
-READS=seqdata/nanopore/gup315_called_demulti/np_all_gup315_trim_filt;
+READS=seqdata/nanopore/2019-08-07_V13/lib4/gup315_called_demulti/np_all_gup315_trim_filt;
+#MAPNAME=map_db_test/mappings/minimap_npv13_gup235_midas31;
 mapper=minimap2;
+#mapper_path=map_db_test/minimap2/minimap2;
+MAPID=80;
 TODAY=$(date '+%Y-%m-%d')
-DATABASE=databases/midas37/midas37_99clust.fa;
+#DATABASE=map_db_test/midas3/singleline_ESV.fa;
+DATABASE=/srv/MA/users/mha/databases/midas37/midas37_99clust.fa;
+#OUTPUT=map_db_test/mappings/minimap_npv13-gup315-midas31_99clust.txt;
 
 clear
 echo ""
@@ -37,7 +42,7 @@ ENDING=".fastq";
 READSEND=$READS$ENDING;
 TRIM="_nametrim.fastq";
 READIDTRIM=$READS$TRIM;
-sed 's/\(runid.*start_\)//' < $READSEND | tr -d '[:blank:]' > seqdata/nanopore/gup315_called_demulti/np_all_gup315_trim_filt_nametrim.fastq
+sed 's/\(runid.*start_\)//' < $READSEND | tr -d '[:blank:]' > seqdata/nanopore/2019-08-07_V13/lib4/gup315_called_demulti/np_all_gup315_trim_filt_nametrim.fastq
 date
 
 echo ""
@@ -46,7 +51,7 @@ sam=".sam";
 MAPPINGNAME=$MAPNAME$sam;
 if [ $mapper = "minimap2" ]
 then
-	minimap2 -ax map-ont -t 40 --secondary=no --MD $DATABASE seqdata/nanopore/gup315_called_demulti/np_all_gup315_trim_filt_nametrim.fastq > mappings/minimap-npv13-lib4-gup315-midas37.sam
+	minimap2 -ax map-ont -t 40 --secondary=no --MD $DATABASE seqdata/nanopore/2019-08-07_V13/lib4/gup315_called_demulti/np_all_gup315_trim_filt_nametrim.fastq > map_db_test/mappings/minimap-npv13-lib4-gup315-midas37.sam
 elif [ $mapper = "usearch10" ]
 then
 	usearch10 -usearch_local $READS -db $DATABASE -strand both -id 0.8 -top_hit_only -maxaccepts 1 -samout $MAPPINGNAME -threads 20
@@ -60,13 +65,15 @@ if [ $mapper = "minimap2" ]
 then
 	echo ""
 	echo "Mapped reads. Removing supplementary mappings based on SAM bit flags"
-	samtools view -F 256 -F 4 -F 2048 mappings/minimap-npv13-lib4-gup315-midas37.sam -o mappings/minimap-npv13-lib4-gup315-midas37_nodupes.sam
+	#nodupes="_nodupes";
+	#MAPNODUPES=$MAPNAME$nodupes$sam;
+	samtools view -F 256 -F 4 -F 2048 map_db_test/mappings/minimap-npv13-lib4-gup315-midas37.sam -o map_db_test/mappings/minimap-npv13-lib4-gup315-midas37_nodupes.sam
 	date
 else
 	:
 fi
 
-sed '/^@/ d' mappings/minimap-npv13-lib4-gup315-midas37_nodupes.sam | \
+sed '/^@/ d' map_db_test/mappings/minimap-npv13-lib4-gup315-midas37_nodupes.sam | \
 	awk '{
     for(i=1;i<=NF;i++){
       if($i ~ /^NM:i:/){sub("NM:i:", "", $i); mm = $i}
@@ -80,4 +87,4 @@ sed '/^@/ d' mappings/minimap-npv13-lib4-gup315-midas37_nodupes.sam | \
     aln=0;
   }' > np_lib4_idmapped.txt
 
-sed 's/barcode/\tbarcode/' np_lib4_idmapped.txt | sed 's/time=/\t/' > mappings/${TODAY}_minimap-npv13-lib4-gup315-midas37-99clust.txt
+sed 's/barcode/\tbarcode/' np_lib4_idmapped.txt | sed 's/time=/\t/' > map_db_test/mappings/${TODAY}_minimap-npv13-lib4-gup315-midas37-99clust.txt
