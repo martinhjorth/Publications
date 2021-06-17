@@ -1,16 +1,16 @@
 READS=seqdata/illumina/il_midasSTD.fastq;
-#DB=map_db_test/midas3/singleline_ESV.fa;
-DB=db/midas31/MiDAS-31-single.fa;
-mapper_path=/space/users/mha/Desktop/Onsite_paper/map_db_test/minimap2/minimap2;
+DB=db/midas37/midas37_single.fa.fa;
 
-$mapper_path -ax sr -t 20 --secondary=no --MD $DB $READS > map_db_test/mappings/illumina_midas31.sam
+# start mapping
+module load Minimap2/2.17-foss-2018a
+minimap2 -ax sr -t 20 --secondary=no --MD $DB $READS > map_db_test/mappings/illumina_midas31.sam
 
 echo ""
 echo "Mapped reads. Removing supplementary mappings based on SAM bit flags"
-samtools view -F 256 -F 4 -F 2048 map_db_test/mappings/illumina_midas31.sam -o map_db_test/mappings/il_midas31_nodupes.sam
+samtools view -F 256 -F 4 -F 2048 output/mappings/illumina_midas37.sam -o output/mappings/il_midas37_nodupes.sam
 date
 
-sed '/^@/ d' map_db_test/mappings/il_midas31_nodupes.sam | \
+sed '/^@/ d' output/mappings/il_midas37_nodupes.sam | \
 	awk '{
     for(i=1;i<=NF;i++){
       if($i ~ /^NM:i:/){sub("NM:i:", "", $i); mm = $i}
@@ -24,4 +24,4 @@ sed '/^@/ d' map_db_test/mappings/il_midas31_nodupes.sam | \
     aln=0;
   }' > idmapped_ilv13.txt
 
-awk -F"\t" -v OFS='\t' '{print $1, $3}' idmapped_ilv13.txt | sed 's/Zbarcode=/\t/' >  map_db_test/mappings/minimap_il_midas31_processed.txt
+awk -F"\t" -v OFS='\t' '{print $1, $3}' idmapped_ilv13.txt | sed 's/Zbarcode=/\t/' >  output/mappings/minimap_il_midas37_processed.txt
