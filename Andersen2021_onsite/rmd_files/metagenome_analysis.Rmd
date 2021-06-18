@@ -1,0 +1,638 @@
+---
+title: "Shallow metagenome community profile"
+author: "Martin Andersen"
+date: "06/05/2020"
+output: html_document
+---
+
+# Aim
+The aim of this project is to compare state of the art methods for 16S rRNA gene amplicon sequencing and shallow metagenome sequencing, i.e. MiDAS 3.7 database vs. the MGP1000DB. We aim to answer how many reads are needed to get accurate abundance measurements of functional groups, such as nitrifiers, for both amplicons and metagenomes. It is then necessary to find out how long it takes to obtain that amount of reads (entire workflow) for the Amplicon workflow and Metagenome workflow.
+
+QC fastq files
+```{bash eval=F}
+module load NanoPlot/1.24.0-foss-2018a
+NanoPlot -t 40 --fastq /srv/MA/users/mha/onlineDNA-shallow-metag/seqdata/nanopore/AaW-location01-mobile-CD2-rapid/20200504_1616_MC-110077_0_FAM95309_1b7070d1/allreads_hac.fastq -o Aaw_loc01_A1_hac
+```
+
+
+# Generate data
+Use minimap2 to map sequencing data
+```{bash, eval=F}
+module load Minimap2/2.15-foss-2018a
+
+# Map high accuracy dataset - replicate 01
+minimap2 -ax map-ont \
+  --cap-sw-mem=50g \
+  -t 40 \
+  --secondary=no \
+  /shared-nfs/MGP1000/cleaned_set_20200120/02_coverm/HQ/HQ_sp_581_concat.fa \
+  -K20M /srv/MA/users/mha/onlineDNA-shallow-metag/seqdata/nanopore/AaW-location01-mobile-CD2-rapid/20200504_1616_MC-110077_0_FAM95309_1b7070d1/fastq_hac/ > \
+  mappings/temp/mapped/20200506_AaW_location01_rapid_metag_hac.sam
+
+# Sort location 1 (barcode 1, reads filtered > 1 kbp) with SAMtools, remove unwanted mappings and calculate depth
+module load SAMtools/1.10-foss-2018a
+samtools view -bS -F 256 \
+  -F 4 \
+  -F 2048 /srv/MA/users/mha/onlineDNA-shallow-metag/seqdata/nanopore/temp/mapped/barcode01.filtered.sam | \
+  samtools sort - | \
+  samtools depth - > mappings/temp/mapped/20200615_AaW_location01_rapid_metag_filt_hac_samdepth.txt
+
+
+
+
+# Use bedtools to calculate coverage of bam file. Should be much faster than SAMtools depth. -bga ensures contigs with 0 coverage are also reported. https://www.biostars.org/p/243615/
+module load BEDTools/2.27.1-GCCcore-6.4.0
+
+bedtools genomecov -ibam mappings/temp/mapped/20200506_AaW_location01_rapid_metag_hac_sort.bam -bga > mappings/temp/mapped/20200511_AaW_location01_rapid_metag_hac_bedtools_bga_genomeCov.txt
+
+samtools view -bS -F 256 \
+  -F 4 \
+  -F 2048 /srv/MA/users/mha/onlineDNA-shallow-metag/seqdata/nanopore/temp/mapped/barcode01.filtered.sam | \
+  samtools sort - | \
+  bedtools genomecov -ibam - -bga > mappings/temp/mapped/20200615_AaW_location01_rapid_metag_1kbpfilt_hac_bedtools_bga_genomeCov.txt
+  
+  
+# Trim off primers and Illumina indices and then map 16S v1-3 data to MiDAS 3.7 (created by ligating NBD103 barcodes and adapters on w. 109 kit)
+bash /srv/MA/users/mha/onlineDNA-shallow-metag/seqdata/nanopore/AaW-loc01-10-mobile-CD2-16S-v13-A1/20200517_1850_MC-110077_0_FAN41050_95b7874c/cutadapt_all.sh
+bash /srv/MA/users/mha/onlineDNA-shallow-metag/seqdata/nanopore/AaW-loc01-10-mobile-CD2-16S-v13-A1/20200517_1850_MC-110077_0_FAN41050_95b7874c/nanopore_mapping-to-otutable_v1.4_16S_midas36.sh gup360_demulti/ 16Sv13_gup360
+
+# Map metagenome data to MiDAS genomeDB (rbk004 kit)
+bash /srv/MA/users/mha/onlineDNA-shallow-metag/seqdata/nanopore/nanopore_mapping-to-otutable_v1.4_MAG.sh all_locations_rbk004_gup360hac/ metag
+
+
+# Count total number of reads in metagenome data (concatenated into barcodes)
+for f in /srv/MA/users/mha/onlineDNA-shallow-metag/seqdata/nanopore/all_locations_rbk004_gup360hac/concatenated/barcode*.fastq; do
+  NAME=$(basename "$f" .fastq)
+  readcount=$(wc -l $f | awk '{print $1/4}')
+  echo -e "$NAME \t $readcount" >> readcounts_metag.txt
+done
+```
+
+
+# Process in R
+Load libs
+```{r load_libs, warning=FALSE, message=F, echo=T}
+library(data.table)
+library(dplyr)
+library(reshape2)
+library(tidyverse)
+library(ggthemes)
+library(scales)
+library(gridExtra)
+library(ampvis2)
+```
+
+Define function for processing loaded files
+```{r message=FALSE, warning=FALSE}
+process_minimap <- function(x) {
+  if (any(colnames(x) %in% "barcode")){
+    barcode <- sub("barcode=", "\\1", x$barcode)
+  }else{
+    barcode = NA
+  }
+  if (any(colnames(x) %in% "read_time")){
+    read_time <- sub(".*T(.*?)", "\\1", x$read_time)
+    read_date <- sub("(.*?)T.*", "\\1", x$read_time)
+    read_datetime <- as.POSIXct(paste(read_date, read_time), format = "%Y-%m-%d %H:%M:%S")
+  }else{
+    read_datetime = NA
+  }
+  if (any(colnames(x) %in% "OTU")){
+    otu <- x$OTU
+  }else if (any(colnames(x) %in% "MAG")){
+    otu = x$MAG
+  }
+  readID <- x$readID
+  Qr <- as.numeric(x$Qlen)/as.numeric(x$alnlen)
+  MapID <- x$MapID %>% as.numeric()
+  Qlen <- x$Qlen %>% as.numeric()
+  alnlen <- x$alnlen %>% as.numeric()
+  alnscore <- x$alnscore %>% gsub(".*:", "", .) %>% as.integer()
+  x_d <- data.table(readID, barcode, read_datetime, otu, Qr, Qlen, alnlen, MapID, alnscore)
+  return(x_d)
+}
+
+```
+
+## Community profile
+Load in data and taxonomy
+```{r message=FALSE, warning=FALSE}
+tax <- fread("data/MAG_statistics_STABLEX_20200309.tsv", select = c("MAG", "MiDAS3_7Tax")) %>% mutate(Tax = gsub(".*tax=", "", MiDAS3_7Tax), Tax = gsub(";", "", Tax), Tax= gsub("[a-z]:", "", Tax), MAG = gsub(".fa", "", MAG)) %>% separate(Tax, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), ",") %>% select(-MiDAS3_7Tax)
+#fwrite(tax, "data/midas_genomedb_tax.txt", sep = "\t", col.names = TRUE, na = "NA", quote = FALSE)
+
+metadata <- readxl::read_excel("data/metadata_shallow-metag.xlsx", col_names = TRUE) %>% as.data.frame() %>% mutate(dataset = case_when(Approach == "metag" ~ "Metagenomes",
+                                                                                                                                        Approach == "amplicon16S" ~ "16S amplicon",
+                                                                                                                                        Approach == "Illumina_16S" ~ "16S Illumina"))
+
+
+
+### Metagenomes, rbk004 kit, guppy 360 hac - reads filtered to > 2kbp prior to mapping
+
+all_metag_map1 <- fread("data/2021-04-15_AaW_mappings_metag_gup360hac_midas_gDB-w-CMStricho_2kbpfilt.txt", header = TRUE, sep = "\t") %>% subset(Qr > 0.85 & Qr < 1.15) # with a Trichococcus bin in the database
+
+
+all_metag_map <- all_metag_map1 %>% process_minimap() %>% mutate(dataset = "Metagenomes")
+
+#transform into "OTU table", where rows are OTU's, columns are sample AND taxonomy
+metag_map_joined <- tax[all_metag_map1, on = "MAG"]
+metag_otutable <- dcast(metag_map_joined, MAG + Kingdom + Phylum + Class + Order + Family + Genus + Species ~ SeqID, fun.aggregate = length) %>% setDT() %>% dplyr::relocate(c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), .after = last_col()) %>% rename(OTU=MAG)
+colnames(metag_otutable) <- sub(".filtered", "", colnames(metag_otutable))
+
+### Format otutable to be able to merge with the 16S amplicon otutable
+MAG_tax <- metag_otutable %>% select(c("OTU", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"))
+MAG_otutab <- metag_otutable %>% select(-c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"))
+
+metadata_rapid_hac <- subset(metadata, Approach == "metag" & Basecall_config == "hac" & db == "genome")
+
+d_amp_metag <- amp_load(otutable = metag_otutable, metadata = metadata_rapid_hac)
+
+metag_readcounts <- fread("data/readcounts_metag_after2kbpfilt.txt", col.names = c("SeqID", "Readcount"))
+######
+
+### 16S v1-3, mapped to MiDAS 3.7
+
+all_16S_otu <- fread("data/2020-05-28_AaW_otutable_16S_gup360hac_midas36_99clust.txt", header = TRUE, sep = "\t") %>% setDT() %>% relocate(c(Kingdom, Phylum, Class, Order, Family, Genus, Species), .after = last_col())  # 
+metadata_16S_midas99 <- subset(metadata, Approach == "amplicon16S" & Basecall_config == "hac" & db == "midas99") %>% mutate(dataset = "16S amplicon")
+
+colnames(all_16S_otu)[2:11] <- as.character(metadata_16S_midas99[1:10,1])
+
+amplicon_otutab <- all_16S_otu %>% select(-c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"))
+amplicon_tax <- all_16S_otu %>% select(c("OTU", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"))
+
+all_16S_map <- fread("data/2020-10-16_AaW_mappings_16Sv13_midas37_gup360_nofilt.txt", header = TRUE, sep = "\t") %>% process_minimap() %>% mutate(dataset = "16S amplicon")
+all_16S_99_map <- fread("data/2020-05-26_AaW_all-locs_16Smappings_gup360hac_nofilt.txt", header = TRUE, sep = "\t") %>% process_minimap() %>% mutate(dataset = "16S_99clust") %>% subset(Qr > 0.85 & Qr < 1.15)
+
+###
+
+
+amp_metag_otutable <- full_join(MAG_otutab, amplicon_otutab, by="OTU") %>% .[!duplicated(.), ]
+
+amp_metag_otutable[is.na(amp_metag_otutable)] <- 0
+
+all_tax <- rbind(MAG_tax, amplicon_tax)
+all_tax2 <- all_tax[!duplicated(all_tax[,c('OTU')]),]
+
+all_otutableWtax <- inner_join(amp_metag_otutable, all_tax2, by = "OTU")
+
+d_amp_metag <- amp_load(otutable = all_otutableWtax, metadata = metadata)
+
+mappings <- rbind(all_16S_map, all_metag_map, all_16S_99_map)
+
+set.seed(42)
+```
+
+Stats
+```{r message=FALSE, warning=FALSE}
+stats <- d_amp_metag %>%
+  amp_alphadiv(measure = c("observed", "shannon"), rarefy = 10000) %>% 
+  dplyr::select(SeqID, Readcount=RawReads, ObservedBins=ObservedOTUs, Approach)
+
+tt2 <- ttheme_default(core=list(fg_params=list(hjust=1, 
+                                                          x = 0.95, 
+                                                          fontsize = 6)),
+                      colhead=list(fg_params=list(fontsize = 8)))
+grid.table(stats, rows= NULL, theme = tt2)
+```
+
+Merge readcounts in order to normalise metagenomes to total reads and not just mapped
+```{r message=FALSE, warning=FALSE}
+readcounts <- full_join(stats, metag_readcounts, by = "SeqID") %>% 
+  mutate(Readcount = case_when(Approach == "metag" ~ as.integer(Readcount.y),
+                            Approach != "metag" ~ as.integer(Readcount.x)))
+```
+
+
+### Plots
+Heatmap of all top 15
+```{r message=FALSE, warning=FALSE}
+d_amp_metag$metadata$dataset <- factor(d_amp_metag$metadata$dataset, levels = c("16S amplicon", "Metagenomes"))
+abund_table <- d_amp_metag$abund %>% select(sort(tidyselect::peek_vars()))
+readcount_vector <- readcounts %>% arrange(SeqID) %>% select(Readcount) %>% unlist()
+
+abund_table_normalised <- sweep(abund_table, 2, readcount_vector, FUN = '/')*100
+d_amp_metag_norm <- d_amp_metag
+d_amp_metag_norm$abund <- abund_table_normalised
+
+p1 <- amp_heatmap(d_amp_metag_norm, 
+            group_by = c("Replicate"), 
+            tax_aggregate = "Genus", 
+            tax_show = 15,
+            tax_add = "Phylum", 
+            tax_class = "p__Proteobacteria",
+            plot_colorscale = "sqrt", 
+            #color_vector = c("White", "Red"),
+            plot_na= T,
+            normalise = F,
+            plot_values = T,
+            tax_empty = "best",
+            min_abundance = 0.5,
+            max_abundance = 9,
+            plot_values_size = 3, 
+            plot_functions = F,
+            #functions = c("AOB", "NOB", "Filamentous"),
+            #rel_widths = c(0.80, 0.20),
+            facet_by = "dataset"
+            )
+p1$heatmap <- p1$heatmap + theme(axis.text.y = element_text(size = 8),
+axis.text.x = element_text(size = 8),
+legend.position = "bottom")
+
+p1
+# ggsave(filename = paste0("figures/",format(Sys.Date(), "%Y-%m-%d"),"_heatmap-both-methods_abs-count-norm.png"), plot = p1, width = 8.7, height = 4.8, dpi = 600)
+```
+
+
+
+Jitter plot
+```{r}
+# Create an ampvis2 boxplot and output the details to manipulate boxplot
+box1clust <- amp_boxplot(d_amp_metag,
+            group_by = "Approach",
+            tax_show = 30,
+            tax_add = "Phylum",
+            detailed_output = TRUE)
+
+# Save the data from the detailed output in a new variable - outputs 9 replicate rows for each sample for some reason
+boxdataclust <- box1clust$plot$data %>%
+  .[!duplicated(.), ]
+
+# Create jitter plot
+ggplot(boxdataclust, aes(x=Display, y=Abundance, color = Group)) +
+  #geom_point(position = position_jitterdodge()) +
+  geom_point(position = position_dodge(width = .5), alpha = 0.8, size = 2.1) +
+  scale_color_colorblind() +
+  guides(col = guide_legend(reverse = TRUE)) +
+  xlab("") +
+  ylab("Read Abundance (%)") +
+  theme_classic() +
+  theme(axis.line = element_line(),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        panel.grid.major = element_line(color = "grey90"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size=14),
+        legend.key.size = unit(1.5, "lines")
+        ) +
+  coord_flip() + 
+  scale_y_continuous(limits = c(0, 14), breaks = seq(0, 14, 1))
+```
+
+## Variance between biological samples
+
+
+
+
+
+### Metagenomes hac
+Metagenomics data will not be rarefied to same amount of reads as the 16S, which has much lower read count. Will instead rarefy to lowest read count in samples.
+```{r message=FALSE, warning=FALSE}
+d_amp_metag_rare <- amp_subset_samples(d_amp_metag, Approach == "metag")
+
+min_reads_metag <- lapply(unique(d_amp_metag_rare$abund), sum) %>% plyr::ldply() %>%
+  dplyr::select(V1) %>%
+  min()
+
+#d_amp_metag_rare$abund <- as.data.frame(t(vegan::rrarefy(t(d_amp_metag_rare$abund), min_reads_metag)))
+
+d_amp_metag_rare$abund <- as.data.frame(t(vegan::rrarefy(t(d_amp_metag_rare$abund), min_reads_metag)))
+```
+
+Estimate variance
+```{r message=FALSE, warning=FALSE}
+#taxcount_metag <- levels(as.factor(d_amp_metag_rare$tax$OTU)) %>% length()
+taxcount_metag <- levels(as.factor(d_amp_metag_rare$tax$Genus)) %>% length()
+#taxcount_il_lib4 <- levels(as.factor(il_amp_lib4$tax$Genus)) %>% length()
+
+# Create an ampvis2 boxplot and output the details to manipulate boxplot
+box_metaglib <- amp_boxplot(d_amp_metag_rare,
+            #group_by = "Investigator",
+            tax_aggregate = "Genus",
+            #tax_aggregate = "OTU",
+            tax_show = taxcount_metag,
+            #tax_add = "Phylum",
+            detailed_output = TRUE,normalise = F)
+
+# Save the data from the detailed output in a new variable - outputs 9 replicate rows for each sample for some reason
+box_metaglib_2 <- box_metaglib$plot$data %>% 
+  .[!duplicated(.), ]
+
+
+variance_metag <- box_metaglib_2 %>% 
+  group_by(Display) %>% 
+  summarise(Mean = mean(Abundance),
+            SD = sd(Abundance),
+            CV = sd(Abundance)/mean(Abundance)*100) %>% 
+  mutate(Variance = "Metagenomes hac")
+```
+
+### Plots of variance
+
+Boxplot Wilcox test
+- The metag data has a much higher similarity than the amplicon16S data; this is most likely due to the fact that the 16S data is mapped to MiDAS, which is much larger than the genome database that the metag dataset is mapped to.
+- Consider limiting the databases to the same amount of sequences (top 100?)
+```{r message=FALSE, warning=FALSE}
+amp_both_rare <- d_amp_metag
+amp_both_rare$abund <- as.data.frame(t(vegan::rrarefy(t(amp_both_rare$abund), min_reads_metag)))
+
+# To normalise the database size we will subset to genera that are present in the metagenomes
+metag_genera <- amp_subset_samples(amp_both_rare, Approach == "metag")$tax$Genus %>% unlist() %>% unique()
+metag_genera <- metag_genera[metag_genera != ""]
+amp_both_rare_select <- amp_subset_taxa(amp_both_rare, tax_vector = metag_genera)
+
+
+formP <- function(pvals,include.p = T){
+  out <- sapply(pvals,function(p){
+    ifelse(p < 0.01 & p > 0.001,round(p,digits = 3),format.pval(p,eps = 0.001,digits = 2))
+  })
+  if (include.p){
+    out <- sapply(out,function(p){
+      ifelse(grepl("<",p),paste0("p ",sub("<","< ",p)),paste0("p = ",p))
+    }) %>% as.vector()
+  } 
+  return(out)
+}
+
+
+# Dissimilarity at Genus level
+dis_genus <- amp_export_long(amp_both_rare_select, metadata_vars = "dataset", tax_levels = "Genus") %>%
+  group_by(SeqID, Genus, dataset) %>% 
+  summarise(count = sum(count)) %>% 
+  ungroup() %>% 
+    split(.,.$dataset) %>%
+    lapply(dcast,formula = SeqID ~ Genus,value.var = "count") %>%
+    lapply(column_to_rownames,var = "SeqID") %>%
+    lapply(vegan::vegdist) %>%
+    sapply(as.vector) %>%
+    data.frame() %>%
+    melt(variable.name = "dataset")
+
+
+# pvalue for Genus level
+pval_genus <- dis_genus %>% 
+  summarise(pval = {
+    wilcox.test(value ~ dataset) %>%
+    .$p.value %>%
+    formP()
+  })
+
+dis_genus$dataset <- recode(dis_genus$dataset, X16S = "16S")
+
+bray_genus <- ggplot(dis_genus,
+  aes(x = value,y = forcats::fct_rev(factor(dataset)), colour = dataset)) + 
+  geom_boxplot(
+    inherit.aes   = F,
+    mapping       = aes(x = value,y = forcats::fct_rev(factor(dataset)),colour = dataset),
+    outlier.shape = NA,
+    lwd           = .2) +
+  geom_jitter(size = .5,width = .1,height = 0) +
+  geom_text(data = pval_genus,mapping = aes(label = pval),x = Inf,y = 1.5,vjust = .5,hjust = 1.2,colour = "black",size = 2.5) +
+  labs(x = "Bray Curtis dissimilarity") + theme_bw() +
+  theme(legend.position = "none", axis.title.y = element_blank()) + scale_x_continuous(limits = c(0.0, 0.4), breaks = seq(0.00, 0.40, 0.05))# + scale_y_discrete(limits = rev(levels(dataset)))
+
+# ggsave(filename = paste0("figures/",format(Sys.Date(), "%Y-%m-%d"),"_Bray-dis-genus-metag-vs-16S.png"), plot = bray_genus, width = 7, height = 3, dpi = 600)
+```
+
+
+## Genus stability - reads required
+How many reads are needed for metagenomes and 16S to get stable community profiles for the most abundant genera?
+
+Pull out read headers from fastq files after filtering, used to calculate relative abundances over time
+```{bash eval=F}
+for f in *.filtered.fastq; do
+  NAME=$(basename "$f" .filtered.fastq)
+  grep '^@.*barcode.*' $f > 2020-10-16_metag_readheaders_$NAME.txt
+done
+```
+
+
+## Genus variance over sequencing depth - all samples
+How does more reads (and thereby time) affect the variance for top genera in the 10 samples for the metagenomes and 16S datasets
+
+Metagenome read headers
+```{r}
+# Load in read headers to determine total number of reads over time
+readheaders_all <- data.frame(readID=NULL, read_datetime=NULL, barcode=NULL)
+header_files<-list.files(path = "data/metagenome_readheaders/", pattern = "readheaders_barcode")
+for (file in header_files){
+  readheader_file <- fread(paste0("data/metagenome_readheaders/", file), header=F) %>% 
+    mutate(readID = sub("time.*", "", V1), 
+           read_datetime = sub(".*time=(.*?)Zbarcode.*", "\\1", V1), 
+           barcode = sub(".*Zbarcode=", "", V1)) %>% 
+    mutate(read_datetime = as.POSIXct(sub("T", " ", read_datetime), format = "%Y-%m-%d %H:%M:%S")) %>% select(-V1)
+  readheaders_all <- rbind(readheaders_all, readheader_file)
+}
+```
+
+### Metagenomes
+```{r}
+metag_map <- mappings %>% subset(dataset == "Metagenomes") %>% inner_join(., tax, by = c("otu" = "MAG"))
+top5_metag <- metag_map %>% group_by(Genus) %>% summarise(count = n()) %>% arrange(count) %>% tail(5) %>% select(Genus) %>% unlist()
+
+# The read_datetime should be based per sample, create a dt for each barcode
+metag_map <- metag_map %>% mutate(deltat = case_when(barcode == "barcode01" ~ read_datetime-min(subset(., barcode == "barcode01")$read_datetime),
+                                                barcode == "barcode02" ~ read_datetime-min(subset(., barcode == "barcode02")$read_datetime),
+                                                barcode == "barcode03" ~ read_datetime-min(subset(., barcode == "barcode03")$read_datetime),
+                                                barcode == "barcode04" ~ read_datetime-min(subset(., barcode == "barcode04")$read_datetime),
+                                                barcode == "barcode05" ~ read_datetime-min(subset(., barcode == "barcode05")$read_datetime),
+                                                barcode == "barcode06" ~ read_datetime-min(subset(., barcode == "barcode06")$read_datetime),
+                                                barcode == "barcode07" ~ read_datetime-min(subset(., barcode == "barcode07")$read_datetime),
+                                                barcode == "barcode08" ~ read_datetime-min(subset(., barcode == "barcode08")$read_datetime),
+                                                barcode == "barcode09" ~ read_datetime-min(subset(., barcode == "barcode09")$read_datetime),
+                                                barcode == "barcode10" ~ read_datetime-min(subset(., barcode == "barcode10")$read_datetime)))
+
+read_count_metag_max <- metag_map %>% group_by(barcode) %>% summarise(total_count = n()) %>% select(total_count) %>% unlist() %>% min()
+
+## Start conditions for genus_loop ##
+datacount <- list()
+readcount <- 0
+cumreadcount <- 0
+
+ind_count <- function(df) {
+  d_otu <- df %>%
+    group_by(barcode, Genus) %>%
+    summarise(Abundance = n(), .groups = 'drop') %>%
+    as.data.frame(stringsAsFactors = FALSE) %>%
+    group_by(Genus) %>% 
+    summarise(Mean = mean(Abundance),
+              total_count = sum(Abundance),
+            SD = sd(Abundance),
+            CV = sd(Abundance)/mean(Abundance)*100,
+            error = qnorm(0.975)*(SD/sqrt(10)),
+            ci_lower = Mean-error,
+            ci_upper = Mean+error,
+            .groups = 'drop')
+  return(d_otu)
+}
+
+
+# Feed in each genus dataframe (e.g. top 5), then a genus_vector is not necessary. A mean abundance is calculated for each genus in each loop, along with a mean of the total read counts (therefore the full dataset is also needed)
+genus_loop <- function(full_dataset, read_count_max, genus_vector, read_step = 500) {
+  datacount <- list()
+  n_reads <- 0
+  cumulative_readcount <- 0
+  cum_mean_readcount <- 0
+  for (i in 1:(read_count_max/read_step)) {
+    # Subset to x reads at a time by using row numbers
+    data_arrange <- full_dataset %>% arrange(., by = deltat) %>% split(.$barcode)
+    data_select <- do.call(rbind, lapply(data_arrange, function(x) x[n_reads:(n_reads+read_step), ]))
+    data <- ind_count(data_select)
+    n_reads <- n_reads + read_step
+    data$cum_readcount <- as.numeric(n_reads)
+    data <- subset(data, Genus %in% genus_vector)
+    if(exists("data_prev")==TRUE){
+      data$genus_cumulative <- as.numeric(data_prev$genus_cumulative) + as.numeric(data$Mean)
+      data_prev <- data
+    } else {
+      data$genus_cumulative <- as.numeric(data$Mean)
+      data_prev <- data
+    }
+    data$dataset <- i
+    datacount[[i]] <- data
+  }
+  loopdata <- do.call(rbind, datacount)
+  return(loopdata)
+}
+
+
+# Create dataframe for abundance development plot
+genusdata_metag <- genus_loop(full_dataset = metag_map, read_count_max = read_count_metag_max, genus_vector = top5_metag, read_step = 300) %>%
+  mutate(fraction = (genus_cumulative/cum_readcount)*100,
+         sd_abund = (SD/cum_readcount)*100,
+         )
+
+### ISSUE! The total read count is based on how many reads that can actually map. Probably not a real issue, but if 50% do not map it is important to note
+# Plot abundance development over time
+p_metag <- ggplot(genusdata_metag, aes(x=cum_readcount, y=fraction, color = Genus)) +
+  geom_line(size=1, alpha = 0.5) +
+  geom_ribbon(aes(ymin = fraction-sd_abund, ymax = fraction+sd_abund, fill = Genus), alpha = 0.4) +
+  scale_x_continuous(breaks=seq(0, 10000, 1000)) +
+  coord_cartesian(xlim = c(0, 10000), ylim = c(0, 15)) +
+  scale_y_continuous(breaks=seq(0, 15, 1)) +
+  scale_fill_manual(values = c("#7fc97f", "#d7191c", "#fdae61", "#d95f02", "#decbe4")) +
+  scale_color_manual(values = c("#7fc97f", "#d7191c", "#fdae61", "#d95f02", "#decbe4")) +
+  theme_bw() +
+  ylab("Relative abundance [%]") +
+  xlab("Cumulative read count") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        legend.title = element_text(size=14, face="bold"),
+        legend.text = element_text(size=12),
+        axis.text = element_text(size=12),
+        axis.title = element_text(size = 14),
+        legend.position = "bottom") +
+  guides(col = guide_legend(nrow = 3)) + ggtitle("Genus abundance development in metagenome data")
+```
+
+
+### 16S
+```{r}
+midas_tax <- fread("data/midas37_tax.txt", header = FALSE, sep = "\t", col.names = c("FLASV", "Tax")) %>% mutate(Tax = gsub("[a-z]__", "", Tax)) %>% separate(Tax, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), "; ")
+amplicon_map <- mappings %>% subset(dataset == "16S amplicon") %>% inner_join(., midas_tax, by = c("otu" = "FLASV"))
+
+top5_amp <- amplicon_map %>% group_by(Genus) %>% summarise(count = n()) %>% arrange(count) %>% tail(5) %>% select(Genus) %>% unlist()
+
+
+amplicon_map <- amplicon_map %>% mutate(deltat = case_when(barcode == "barcode01" ~ read_datetime-min(subset(., barcode == "barcode01")$read_datetime),
+                                                barcode == "barcode02" ~ read_datetime-min(subset(., barcode == "barcode02")$read_datetime),
+                                                barcode == "barcode03" ~ read_datetime-min(subset(., barcode == "barcode03")$read_datetime),
+                                                barcode == "barcode04" ~ read_datetime-min(subset(., barcode == "barcode04")$read_datetime),
+                                                barcode == "barcode05" ~ read_datetime-min(subset(., barcode == "barcode05")$read_datetime),
+                                                barcode == "barcode06" ~ read_datetime-min(subset(., barcode == "barcode06")$read_datetime),
+                                                barcode == "barcode07" ~ read_datetime-min(subset(., barcode == "barcode07")$read_datetime),
+                                                barcode == "barcode08" ~ read_datetime-min(subset(., barcode == "barcode08")$read_datetime),
+                                                barcode == "barcode09" ~ read_datetime-min(subset(., barcode == "barcode09")$read_datetime),
+                                                barcode == "barcode10" ~ read_datetime-min(subset(., barcode == "barcode10")$read_datetime)))
+
+
+read_count_amp_max <- amplicon_map %>% group_by(barcode) %>% summarise(total_count = n()) %>% select(total_count) %>% unlist() %>% min()
+
+## Start conditions for genus_loop ##
+datacount <- list()
+readcount <- 0
+cumreadcount <- 0
+
+ind_count <- function(df) {
+  d_otu <- df %>%
+    group_by(barcode, Genus) %>%
+    summarise(Abundance = n(), .groups = 'drop') %>%
+    as.data.frame(stringsAsFactors = FALSE) %>%
+    #ungroup() %>% 
+    group_by(Genus) %>% 
+    summarise(Mean = mean(Abundance),
+              total_count = sum(Abundance),
+            SD = sd(Abundance),
+            CV = sd(Abundance)/mean(Abundance)*100,
+            error = qnorm(0.975)*(SD/sqrt(10)),
+            ci_lower = Mean-error,
+            ci_upper = Mean+error,
+            .groups = 'drop')
+  return(d_otu)
+}
+
+
+# Feed in each genus dataframe (e.g. top 5), then a genus_vector is not necessary. A mean abundance is calculated for each genus in each loop, along with a mean of the total read counts (therefore the full dataset is also needed)
+genus_loop <- function(full_dataset, read_count_max, genus_vector, read_step = 500) {
+  datacount <- list()
+  n_reads <- 0
+  cumulative_readcount <- 0
+  cum_mean_readcount <- 0
+  for (i in 1:(read_count_max/read_step)) {
+    # Subset to x reads at a time by using row numbers
+    data_arrange <- full_dataset %>% arrange(., by = deltat) %>% split(.$barcode)
+    data_select <- do.call(rbind, lapply(data_arrange, function(x) x[n_reads:(n_reads+read_step), ]))
+    data <- ind_count(data_select)
+    n_reads <- n_reads + read_step
+    data$cum_readcount <- as.numeric(n_reads)
+    data <- subset(data, Genus %in% genus_vector)
+    if(exists("data_prev")==TRUE){
+      data$genus_cumulative <- as.numeric(data_prev$genus_cumulative) + as.numeric(data$Mean)
+      data_prev <- data
+    } else {
+      data$genus_cumulative <- as.numeric(data$Mean)
+      data_prev <- data
+    }
+    data$dataset <- i
+    datacount[[i]] <- data
+  }
+  loopdata <- do.call(rbind, datacount)
+  return(loopdata)
+}
+
+# Create dataframe for abundance development plot
+genusdata_amp <- genus_loop(full_dataset = amplicon_map, read_count_max = read_count_amp_max, genus_vector = top5_amp, read_step = 300) %>%
+  mutate(fraction = (genus_cumulative/cum_readcount)*100,
+         sd_abund = (SD/cum_readcount)*100,
+         )
+
+### ISSUE! The total read count is based on how many reads that can actually map. Probably not a real issue, but if 50% do not map it is important to note
+# Plot abundance development over time
+p16s <- ggplot(genusdata_amp, aes(x=cum_readcount, y=fraction, color = Genus)) +
+  geom_line(size=1, alpha = 0.5) +
+  geom_ribbon(aes(ymin = fraction-sd_abund, ymax = fraction+sd_abund, fill = Genus), alpha = 0.4) +
+  scale_x_continuous(breaks=seq(0, 10000, 1000)) +
+  coord_cartesian(xlim = c(0, 10000), ylim = c(0, 15)) +
+  scale_y_continuous(breaks=seq(0, 15, 1)) +
+  scale_fill_manual(values = c("#d7191c", "#fdae61", "#ffffbf", "#abd9e9", "#2c7bb6")) +
+  scale_color_manual(values = c("#d7191c", "#fdae61", "#ffffbf", "#abd9e9", "#2c7bb6")) +
+  theme_bw() +
+  ylab("Relative abundance [%]") +
+  xlab("Cumulative read count") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        legend.title = element_text(size=14, face="bold"),
+        legend.text = element_text(size=12),
+        axis.text = element_text(size=12),
+        axis.title = element_text(size = 14),
+        legend.position = "bottom") +
+  guides(col = guide_legend(nrow = 3)) + ggtitle("Genus abundance development in 16S V1-3 data")
+```
+
+```{r}
+grid.arrange(p_metag, p16s, nrow = 2)
+# g <- arrangeGrob(p_metag, p16s, nrow = 2)
+
+# ggsave(file=paste0("figures/", format(Sys.time(), "%Y-%m-%d"),"_abund-development-reads-metag-16S.png"), g, width = 10, height = 12, dpi=600)
+```
