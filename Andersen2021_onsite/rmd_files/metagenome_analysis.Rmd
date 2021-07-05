@@ -128,7 +128,7 @@ metadata <- readxl::read_excel("data/metadata_shallow-metag.xlsx", col_names = T
 
 ### Metagenomes, rbk004 kit, guppy 360 hac - reads filtered to > 2kbp prior to mapping
 
-all_metag_map1 <- fread("data/2021-04-15_AaW_mappings_metag_gup360hac_midas_gDB-w-CMStricho_2kbpfilt.txt", header = TRUE, sep = "\t") %>% subset(Qr > 0.85 & Qr < 1.15) # with a Trichococcus bin in the database
+all_metag_map1 <- fread("data/2021-07-05_AaW_mappings_metag_gup360hac_midas_gDB_2kbpfilt.txt", header = TRUE, sep = "\t") %>% subset(Qr > 0.85 & Qr < 1.15) # 
 
 
 all_metag_map <- all_metag_map1 %>% process_minimap() %>% mutate(dataset = "Metagenomes")
@@ -238,7 +238,47 @@ axis.text.x = element_text(size = 8),
 legend.position = "bottom")
 
 p1
-# ggsave(filename = paste0("figures/",format(Sys.Date(), "%Y-%m-%d"),"_heatmap-both-methods_abs-count-norm.png"), plot = p1, width = 8.7, height = 4.8, dpi = 600)
+ggsave(filename = paste0("figures/",format(Sys.Date(), "%Y-%m-%d"),"_heatmap-both-methods_abs-count-norm.png"), plot = p1, width = 8.7, height = 4.8, dpi = 600)
+
+p_meta <- amp_heatmap(amp_subset_samples(d_amp_metag_norm, dataset == "Metagenomes"), 
+            group_by = c("Replicate"), 
+            tax_aggregate = "Genus", 
+            tax_show = 25,
+            tax_add = "Phylum", 
+            tax_class = "p__Proteobacteria",
+            plot_colorscale = "sqrt", 
+            plot_na= T,
+            normalise = F,
+            plot_values = T,
+            tax_empty = "best",
+            min_abundance = 0.5,
+            max_abundance = 9,
+            plot_values_size = 3 
+            )
+
+top25_metag <- p_meta$data$Display %>% unique() %>% droplevels()
+
+p_amp <- amp_heatmap(amp_subset_samples(d_amp_metag_norm, dataset == "16S amplicon"), 
+            group_by = c("Replicate"), 
+            tax_aggregate = "Genus", 
+            tax_show = 25,
+            tax_add = "Phylum", 
+            tax_class = "p__Proteobacteria",
+            plot_colorscale = "sqrt", 
+            plot_na= T,
+            normalise = F,
+            plot_values = T,
+            tax_empty = "best",
+            min_abundance = 0.5,
+            max_abundance = 9,
+            plot_values_size = 3 
+            )
+
+top25_amp <- p_amp$data$Display %>% unique() %>% droplevels()
+
+cowplot::plot_grid(p_amp, p_meta)
+
+Reduce(intersect, list(top25_amp, top25_metag)) %>% length()
 ```
 
 
@@ -631,8 +671,8 @@ p16s <- ggplot(genusdata_amp, aes(x=cum_readcount, y=fraction, color = Genus)) +
 ```
 
 ```{r}
-grid.arrange(p_metag, p16s, nrow = 2)
-# g <- arrangeGrob(p_metag, p16s, nrow = 2)
+# grid.arrange(p_metag, p16s, nrow = 2)
+g <- arrangeGrob(p_metag, p16s, nrow = 2)
 
-# ggsave(file=paste0("figures/", format(Sys.time(), "%Y-%m-%d"),"_abund-development-reads-metag-16S.png"), g, width = 10, height = 12, dpi=600)
+ggsave(file=paste0("figures/", format(Sys.time(), "%Y-%m-%d"),"_abund-development-reads-metag-16S.png"), g, width = 10, height = 12, dpi=600)
 ```
