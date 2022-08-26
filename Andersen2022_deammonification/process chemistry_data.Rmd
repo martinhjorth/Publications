@@ -1,0 +1,319 @@
+---
+title: "VCS DEMON tanks physicochemical data"
+date: "`r format(Sys.time(), '%d-%m-%Y')`, Aalborg, Denmark"
+author: "Lisette Thomsen & Martin Andersen"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r message=FALSE, warning=FALSE}
+library(data.table)
+library(dplyr)
+library(reshape2)
+library(tidyverse)
+library(scales)
+#library(ggthemes)
+#library(ampvis2)
+num_cores <- parallel::detectCores(all.tests = FALSE, logical = TRUE)
+setDTthreads(threads = num_cores-2)
+```
+
+## Load in new data
+```{r message=FALSE, warning=FALSE}
+### Here we check if a file exists describing which files were previously processed. If not, all files will be loaded in and processed. If there is, only new files will be loaded in, processed and then bound with previously processed files. The ~ grep is to remove any potentially open files from the list (having a file open creates a temporary hidden file with a ~ in front of the filename)
+files <- list.files(path = "kemi_data/Metadata/", pattern = "DNA") %>% grep("~", ., invert = TRUE,value = TRUE)
+
+print("Checking which files have been processed previously...")
+
+if (file.exists("kemi_data/Metadata/processed_files.txt")) {
+  alreadyProcessed <- fread("kemi_data/Metadata/processed_files.txt", header = FALSE, sep = ",") %>% unname() %>% unlist()
+  files_to_load <- data.frame(filelist = files) %>% 
+    subset(!(filelist %in% alreadyProcessed)) %>% 
+    unname() %>% 
+    droplevels() %>% 
+    unlist() %>% as.character()
+  print(paste0("Found ", length(files_to_load), " files that have not been processed. Loading files."))
+  oldfiles <- fread("kemi_data/Metadata/all_data_hourly.txt", header = TRUE, sep = ",", colClasses = c("character", "factor", "factor", "numeric"))
+  # Change date ISO format to POSIXct again
+  oldfiles <- oldfiles %>% mutate(timebucket = 
+    as.POSIXct(paste(
+      sub("(.*?)T.*", "\\1",timebucket), 
+      sub(".*T(.*?)Z", "\\1", timebucket)
+      ), format = "%Y-%m-%d %H")#,
+    #timebucket2 = format(timebucket, format = "%Y-%m-%d %H"),
+    #timebucket3 = as.POSIXct(strptime(timebucket2,"%Y-%m-%d %H"))#,
+    #timebucket = format(timebucket, format = "%Y-%m-%d %H")
+    ) # Use the same format as was used above
+} else {
+  files_to_load <- files
+  print(paste0("No processed files found. Loading in all files (", length(files_to_load), " files)."))
+  oldfiles <- data.frame()
+}
+
+## Lab data ##
+lab_files <- list.files(path = "kemi_data/", pattern = "Lab", ignore.case = TRUE) %>% grep("~", ., invert = TRUE,value = TRUE)
+if (file.exists("kemi_data/processed_lab_files.txt")) {
+  LabalreadyProcessed <- fread("kemi_data/processed_lab_files.txt", header = FALSE, sep = ",") %>% unname() %>% unlist()
+  Labfiles_to_load <- data.frame(Labfilelist = lab_files) %>% 
+    subset(!(Labfilelist %in% LabalreadyProcessed)) %>% 
+    unname() %>% 
+    droplevels() %>% 
+    unlist() %>% as.character()
+  print(paste0("Found ", length(Labfiles_to_load), " Lab files that have not been processed. Loading files."))
+  oldLabfiles <- fread("kemi_data/Metadata/all_LabData.txt", header = TRUE, sep = ",", colClasses = c("character", "factor", "factor", "numeric"))
+} else {
+  Labfiles_to_load <- lab_files
+  print(paste0("No processed Lab files found. Loading in all files (", length(Labfiles_to_load), " files)."))
+  oldLabfiles <- data.frame()
+}
+
+if (length(Labfiles_to_load>0)) {
+  newLabfiles <- data.frame()
+  labColNames_tank1 <- c("Date", "T1_NH4", "T1_NO2", "T1_NO3", "T1_SS", "T1_pH")
+  labColNames_tank2 <- c("Date", "T2_NH4", "T2_NO2", "T2_NO3", "T2_SS", "T2_pH")
+  for (file in Labfiles_to_load){
+    ## Tank 1
+    tank1 <- readxl::read_excel(paste0("kemi_data/", file), col_names = TRUE, sheet = "SD1") %>% setNames(labColNames_tank1)
+    tank1_naRows <- apply(tank1, 1, function(x) all(is.na(x)))
+    tank1_trim <- tank1[ !tank1_naRows, ] %>% drop_na(Date)
+    tank1M <- tank1_trim %>% melt(., id.vars = "Date") %>% mutate(Tank = gsub("T([1-2])_.*$", "\\1", variable),
+                                                                  variable = gsub("T[1-2]_", "", variable)) %>% 
+      drop_na()
+    ## Tank 2
+    tank2 <- readxl::read_excel(paste0("kemi_data/", file), col_names = TRUE, sheet = "SD2") %>% setNames(labColNames_tank2)
+    tank2_naRows <- apply(tank2, 1, function(x) all(is.na(x)))
+    tank2_trim <- tank2[ !tank2_naRows, ] %>% drop_na(Date)
+    tank2M <- tank2_trim %>% melt(., id.vars = "Date") %>% mutate(Tank = gsub("T([1-2])_.*$", "\\1", variable),
+                                                                  variable = gsub("T[1-2]_", "", variable)) %>% 
+      drop_na()
+    both_tanks_lab <- rbind(tank1M, tank2M)
+    newLabfiles <- rbind(newLabfiles, both_tanks_lab)
+  }
+}
+
+if (exists("newLabfiles") == TRUE) {
+  allLab_data <- rbind(oldLabfiles, newLabfiles)
+  allLab_data %>% select(Date, Tank, variable, value) %>% fwrite(file = "kemi_data/all_Labdata.txt", append = FALSE, col.names = TRUE, sep = ",", dateTimeAs = "ISO")
+
+  ## Write out which files have been processed so they won't be loaded in for processing again
+  lab_files %>% as.data.frame() %>% fwrite(file = "kemi_data/processed_lab_files.txt", append = FALSE, col.names = FALSE)
+} else {
+  newLabfiles <- data.frame()
+  allLab_data <- rbind(oldLabfiles, newLabfiles)
+}
+
+## Load here, only if there are any files to load
+
+if (length(files_to_load>0)) {
+  newfiles <- data.frame()
+  col_select <- c("StartTime", "V1-BO1_O2_mg/l", "V1-BN1_ss_mg/l", "V1-BU2_NH4_mg/l", "V1-BU3_NO2_mg/l", "V1-BU5_NO3_mg/l", "V1-BC1_pH", "V2-BO1_O2_mg/l", "V2-BN1_ss_mg/l", "V2-BU2_NH4_mg/l", "V2-BU3_NO2_mg/l", "V2-BU5_NO3_mg/l", "V2-BC1_pH", "V1-BT2_TMP_°C", "V2-BT2_TMP_°C", "V1-BU1_N2O_mg/l", "V2-BU1_N2O_mg/l", "V1-Air_Flow_m3/h", "V2-Air_Flow_m3/h", "V1-BF1_NH4_kg/h", "V1-Til_LT_NH4_kg/h", "V2-BF1_NH4_kg/h", "V2-Til_LT_NH4_kg/h", "V1-BF1_FLOW_m3/h", "V1-BF2_Flow_m3/h", "V1-BF3_Flow_m3/h", "V1-BF4_Flow_m3/h", "V2-BF1_FLOW_m3/h", "V2-BF2_Flow_m3/h", "V2-BF3_Flow_m3/h", "V2-BF4_Flow_m3/h")
+  col_names <- c("Time", "V1-O2", "V1-SS", "V1-NH4", "V1-NO2", "V1-NO3", "V1-pH", "V2-O2", "V2-SS", "V2-NH4", "V2-NO2", "V2-NO3", "V2-pH", "V1-Temp", "V2-Temp", "V1-N2O", "V2-N2O", "V1-AirFlow", "V2-AirFlow", "V1-NH4_in", "V1-NH4_out", "V2-NH4_in", "V2-NH4_out", "V1-Centrate_in", "V1-Water_in", "V1-Flow_hydrocyclone", "V1-Flow_feedtank", "V2-Centrate_in", "V2-Water_in", "V2-Flow_hydrocyclone", "V2-Flow_feedtank")
+  for (file in files_to_load){
+    file_read <- fread(
+      paste0("kemi_data/Metadata/",file),
+      header = TRUE,
+      #select = col_select,
+      sep = ";",
+      dec = ","
+      #col.names = col_names
+    )
+    # QC development - make sure all files are processed
+    #file_rows <- nrow(file_read)
+    #total_rows <- total_rows+file_rows
+    
+    newfiles<-rbind(newfiles,file_read, fill=TRUE)
+  }
+  newfiles <- newfiles[, ..col_select]
+  names(newfiles) <- col_names
+}
+
+## Process loaded data, if the "newfiles" object exists
+if (exists("newfiles") == TRUE) {
+  ### The two first rows are empty, so these are removed
+  df <- newfiles[-c(1,2),]
+  ## Process data 
+  df$Time <- as.POSIXct.default(df$Time, format = "%d-%m-%Y %H:%M")
+  dfM <- df %>% 
+    melt(., id.vars = "Time") %>% 
+    mutate(Tank = gsub("V([1-2])-.*$", "\\1", variable),
+                     variable = gsub("V[1-2]-", "", variable))
+  
+  # Change date to ISO format, remove minutes to get mean values per hour
+  dfM_hour <- dfM %>% 
+    mutate(timebucket = format(Time, format = "%Y-%m-%d %H")) %>% 
+    group_by(timebucket, Tank, variable) %>% 
+    summarise(mean = mean(value))
+  
+  # The formatting above changed the time to character - change back to POSIXct to be able to use the scale_x_datetime scale when plotting.
+  dfM_hour$timebucket <- as.POSIXct(dfM_hour$timebucket, format = "%Y-%m-%d %H") # Use the same format as was used above
+  dfM_hour <- dfM_hour %>% ungroup()
+  
+  ## Bind with previous files and then write out for easy load next time
+  df_all <- rbind(oldfiles, dfM_hour)
+  df_all %>% fwrite(file = "kemi_data/Metadata/all_data_hourly.txt", append = FALSE, col.names = TRUE, sep = ",", dateTimeAs = "ISO")
+
+  ## Write out which files have been processed so they won't be loaded in for processing again
+  files %>% as.data.frame() %>% fwrite(file = "kemi_data/Metadata/processed_files.txt", append = FALSE, col.names = FALSE)
+} else {
+  df_all <- oldfiles
+  df_all$timebucket <- as.POSIXct(df_all$timebucket, format = "%Y-%m-%d %H")
+}
+# Remove objects that are no longer needed
+suppressWarnings(rm(oldfiles, dfM_hour, dfM, df, newfiles, files, file, alreadyProcessed, files_to_load, file_read, col_names, col_select))
+```
+
+Process more - smooth NAs and make moving averages
+```{r message=FALSE, warning=FALSE}
+library(zoo)
+
+# Smooth over NA values - up to 4 in a row by taking average of previous 2 and forward 2 values. Then calculate moving averages based on these values
+df_all_smooth <- df_all %>% 
+  group_by(Tank, variable) %>% 
+  mutate(newMean = rollapply(c(NA, NA, mean, NA, NA), 5, 
+    function(x) if (is.na(x[3])) mean(x, na.rm = TRUE) else x[3]),
+        mean_07d = rollmean(newMean, k = 7*24, fill = NA),
+        mean_05d = rollmean(newMean, k = 5*24, fill = NA),
+        mean_03d = rollmean(newMean, k = 3*24, fill = NA)) %>% 
+  ungroup()
+```
+
+
+# Plots
+
+### Overview
+Select only relevant parameters
+```{r message=FALSE, warning=FALSE}
+df_all_select <- df_all %>% subset(!(variable %in% c("AirFlow")))
+```
+
+Tank 1
+```{r fig.height = 10, fig.width = 15, fig.align='center', message=FALSE, warning=FALSE}
+# Plot
+hline.data <-data.frame(thresholds = c(125, 100, 20), variable = c("NH4", "NO3", "NO2"))
+
+line.text <- data.frame(timebucket = c(as.POSIXct("2020-02-17"), as.POSIXct("2020-05-04"), as.POSIXct("2020-06-29"), as.POSIXct("2020-08-03")),
+                        text = c("Bleed-out", "Baseline sampling start", "Increase O2, membrane foul", "Max O2 successful"))
+line.text$text <- factor(line.text$text, levels = c("Bleed-out", "Baseline sampling start", "Increase O2, membrane foul", "Max O2 successful"))
+
+p1_overview <- 
+  ggplot(subset(df_all_select, Tank == "1"), aes(x = timebucket, y = mean)) + 
+  geom_point(alpha=0.6) + 
+  facet_grid(vars(variable), scales = "free") +
+  geom_hline(aes(yintercept = thresholds), hline.data) +
+  geom_vline(aes(xintercept = as.numeric(timebucket), color = as.factor(text)), data = line.text) +
+  theme_bw() +
+  theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=14,face="bold"),
+        axis.text.x = element_text(angle=45, hjust=1),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 14),
+        plot.title = element_text(size = 16),
+        strip.text.y = element_text(size = 14, colour = "orange")) +
+  scale_x_datetime(labels = date_format("%Y-%m-%d"),
+                   date_breaks = ("1 week"))
+
+p1_overview + ggtitle("VCS DEMON tank 1, Nov. 2019-Nov. 2020 online sensor data") + xlab("Date") + ylab("Hourly mean value")
+```
+
+Tank 2
+```{r fig.height = 10, fig.width = 15, fig.align='center', message=FALSE, warning=FALSE}
+# Plot
+p2_overview <- 
+  ggplot(subset(df_all_select, Tank == "2"), aes(x = timebucket, y = mean)) + 
+  geom_point(alpha=0.6) + 
+  facet_grid(vars(variable), scales = "free") +
+  geom_hline(aes(yintercept = thresholds), hline.data) +
+  geom_vline(aes(xintercept = as.numeric(timebucket), color = as.factor(text)), data = line.text) +
+  theme_bw() +
+  theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=14,face="bold"),
+        axis.text.x = element_text(angle=45, hjust=1),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 14),
+        plot.title = element_text(size = 16),
+        strip.text.y = element_text(size = 14, colour = "orange")) +
+  scale_x_datetime(labels = date_format("%Y-%m-%d"),
+                   date_breaks = ("1 week"))
+
+p2_overview + ggtitle("VCS DEMON tank 2, Nov. 2019-Nov. 2020 online sensor data") + xlab("Date") + ylab("Hourly mean value")
+```
+
+
+### Since start august
+```{r fig.height = 10, fig.width = 15, fig.align='center', message=FALSE, warning=FALSE}
+# Since start august
+hline.data <-data.frame(thresholds = c(125, 100, 20), variable = c("NH4", "NO3", "NO2"))
+color_vector <- c("3 day MA"="#f04546",
+          "5 day MA"="#3591d1",
+          "Thresholds" = "black")
+
+august_now <- df_all_smooth %>% subset(timebucket >= "2020-08-01" & !(variable %in% c("AirFlow")))
+
+# Tank 1
+ggplot(subset(august_now, Tank == 1)) + 
+  geom_point(aes(x=timebucket, y=mean), alpha=0.5) + 
+  geom_line(aes(x=timebucket, y=mean_03d, group=1, color = "3 day MA")) + 
+  geom_line(aes(x=timebucket, y=mean_05d, group=1, color = "5 day MA")) + 
+  geom_hline(aes(yintercept = thresholds, color = "Thresholds"), hline.data, linetype = "dashed") +
+  facet_grid(vars(variable), scales = "free") +
+  theme_bw() +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom",
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        axis.text.x = element_text(angle=45, hjust=1),
+        legend.text = element_text(size = 14),
+        plot.title = element_text(size = 16),
+        strip.text.y = element_text(size = 14, colour = "orange")) +
+  xlab("Date") + ylab("Hourly mean value") +
+  scale_colour_manual(name="Moving average",values=color_vector) +
+  scale_x_datetime(labels = date_format("%Y-%m-%d"),
+                   date_breaks = ("1 week")) +
+  ggtitle("VCS DEMON tank 1, Aug. 2020-Nov. 2020 online sensor data")
+
+# Tank 2
+ggplot(subset(august_now, Tank == 2)) + 
+  geom_point(aes(x=timebucket, y=mean), alpha=0.5) + 
+  geom_line(aes(x=timebucket, y=mean_03d, group=1, color = "3 day MA")) + 
+  geom_line(aes(x=timebucket, y=mean_05d, group=1, color = "5 day MA")) + 
+  geom_hline(aes(yintercept = thresholds, color = "Thresholds"), hline.data, linetype = "dashed") +
+  facet_grid(vars(variable), scales = "free") +
+  theme_bw() +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom",
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 14),
+        plot.title = element_text(size = 16),
+        strip.text.y = element_text(size = 14, colour = "orange")) +
+  xlab("Date") + ylab("Hourly mean value") +
+  scale_colour_manual(name="Moving average",values=color_vector) +
+  scale_x_datetime(labels = date_format("%Y-%m-%d"),
+                   date_breaks = ("1 week")) +
+  ggtitle("VCS DEMON tank 2, Aug. 2020-Nov. 2020 online sensor data")
+```
+
+Overlay points to compare tanks
+```{r fig.height = 10, fig.width = 15, fig.align='center', message=FALSE, warning=FALSE}
+ggplot(august_now) + 
+  geom_point(aes(x=timebucket, y=mean, color = factor(Tank)), alpha=0.5) + 
+  #geom_line(aes(x=timebucket, y=mean_03d, group=1, color = "3 day MA")) + 
+  #geom_line(aes(x=timebucket, y=mean_05d, group=1, color = "5 day MA")) + 
+  geom_hline(aes(yintercept = thresholds), hline.data, linetype = "dashed") +
+  facet_grid(vars(variable), scales = "free") +
+  theme_bw() +
+  theme(#legend.title = element_blank(),
+        legend.position = "bottom",
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        axis.text.x = element_text(angle=45, hjust=1),
+        legend.text = element_text(size = 14),
+        plot.title = element_text(size = 16),
+        strip.text.y = element_text(size = 14, colour = "orange")) +
+  xlab("Date") + ylab("Hourly mean value") +
+  scale_x_datetime(labels = date_format("%Y-%m-%d"),
+                   date_breaks = ("1 week")) +
+  scale_colour_manual(name="Tank",values= c("#f04546","#3591d1")) +
+  ggtitle("VCS DEMON tanks, Aug. 2020-Nov. 2020 online sensor data")
+```

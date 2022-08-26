@@ -1,0 +1,388 @@
+---
+title: "QC seqdata for VCS showcase"
+author: "Martin Hjorth Andersen"
+date: "26/10/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Load libs
+```{r load_libs, warning=FALSE, message=F, echo=T}
+library(data.table)
+library(dplyr)
+library(reshape2)
+library(tidyverse)
+library(ggthemes)
+library(scales)
+library(gridExtra)
+library(ampvis2)
+```
+
+Load VCS data
+```{r message=F}
+otuFiles <- list.files(path = "data/", pattern = "otutable_midas37.txt")
+newestFile <- tail(otuFiles, 1)
+
+otutable <- fread(paste0("data/", newestFile), header = TRUE, sep = "\t")
+metadata <- readxl::read_excel("metadata_VCS.xlsx", col_names = TRUE, sheet = "metadata") %>% as.data.frame() %>% subset(Primer == "bV4-A"  & Platform == "Nanopore" & !(runID %in% c("juneB1", "julyB1"))) %>% mutate(Date = as.Date(Date, origin = "1899-12-30")) # Remove the runs where we had primer issues
+
+d_amp <- amp_load(otutable, metadata)
+d_amp_s <- amp_subset_samples(d_amp, !(SampleNo %in% c("PC", "NC", "EXT NEG", "392") & !(samplingSpot %in% c("Demon", "hydroclone", "overflow"))))
+
+d_amp_d<-amp_subset_samples(d_amp, samplingSpot %in% c("Demon", "hydrocyclone", "overflow"))
+T1 <- amp_subset_samples(d_amp_d, Tank == "01")
+T2 <- amp_subset_samples(d_amp_d, Tank == "02")
+
+
+
+set.seed(42) # For reproducibility
+```
+
+### Nanopore vs Illumina
+Load VCS Nanopore and Illumina baseline
+```{r eval = FALSE}
+otu_illu <- fread("data/2020-11-24_otutable_midas37_Ilumina_25-124_baseline.txt", header = TRUE, sep = "\t")
+otu_nano <- fread("data/2020-11-19_otutable_midas37.txt", header = TRUE, sep = "\t")
+
+metadata_comparison <- readxl::read_excel("metadata_VCS.xlsx", col_names = TRUE, sheet = "metadata") %>% as.data.frame() %>% subset(Primer == "bV4-A"  & !(runID %in% c("juneB1", "julyB1"))) %>% mutate(Date = as.Date(Date, origin = "1899-12-30")) #
+
+d_amp_il <- amp_load(otu_illu, metadata_comparison) %>% amp_subset_samples(!(type == "control") & !(SampleNo == "100"))
+illumina_samples <- d_amp_il$metadata$SampleNo
+
+d_amp_nano <- amp_load(otu_nano, metadata_comparison) %>% amp_subset_samples(SampleNo %in% illumina_samples & !(type == "control"))
+```
+
+Merge Nanopore and Illumina OTU tables
+```{r}
+otutable_il_tax <- otu_illu %>% select(c("OTU", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"))
+otutable_il_samples <- otu_illu %>% select(-c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"))
+
+otutable_nano_tax <- otu_nano %>% select(c("OTU", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"))
+otutable_nano_samples <- otu_nano %>% select(-c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"))
+
+# Merge the samples together in one otutable
+merged_otutable <- full_join(otutable_il_samples, otutable_nano_samples, by="OTU")
+colnames(merged_otutable)
+
+merged_otutable[is.na(merged_otutable)] <- 0
+
+all_taxonomy <- rbind(otutable_il_tax, otutable_nano_tax)
+all_taxonomy_unique <- all_taxonomy[!duplicated(all_taxonomy[,c('OTU')]),]
+
+print(paste0("Removed ", nrow(all_taxonomy)-nrow(all_taxonomy_unique), " rows where there were duplicate OTU entries"))
+
+# So now we can finally join the taxonomy with the samples, as there is an OTU column in both dataframes
+merged_otutable_wtax <- inner_join(merged_otutable, all_taxonomy_unique, by = "OTU")
+
+# Load into ampvis and subset to samples present in the Illumina dataset
+d_amp_both <- amp_load(merged_otutable_wtax, metadata_comparison) %>% amp_subset_samples(SampleNo %in% illumina_samples) %>%amp_subset_samples(., !(SampleNo %in% c("PC", "NC", "EXT NEG", "192", "100") & !(ExtractionID %in% c("PC", "NC"))))
+
+start_sampling_date <- "2020-05-04"
+d_amp_both$metadata$delta_days <- round(difftime(d_amp_both$metadata$Date, start_sampling_date, units = "days"),0)
+```
+
+
+### Nanopore vs. Illumina
+Heatmap
+```{r}
+# HEATMAP
+genus_heat <- amp_heatmap(amp_subset_samples(d_amp_both, Tank == "01"),
+            group_by = c("delta_days"),
+            facet_by = "Platform",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 25,
+            #color_vector = c("blue","white", "red3"),
+            plot_values_size = 3, textmap=F) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "none", plot.title = element_text(size=14), axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 1))# +
+  #ggsave(filename = paste0("figures/",format(Sys.Date(), "%Y-%m-%d"),"_heatmap-platforms-tank1.png"), width = 14, height = 9, dpi = 600)
+
+species_heat <- amp_heatmap(amp_subset_samples(d_amp_both, Tank == "01"),
+            group_by = c("delta_days"),
+            facet_by = "Platform",
+            tax_aggregate = "Species",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 25,
+            #color_vector = c("blue","white", "red3"),
+            plot_values_size = 3, textmap=F) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "none", plot.title = element_text(size=14), axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 1))
+
+
+p_figS3 <- cowplot::plot_grid(genus_heat, species_heat, ncol = 1, align = "v", axis = "b", labels = c('A', 'B'))
+ggsave(filename = paste0("figures/",format(Sys.Date(), "%Y-%m-%d"), "_heatmap-platforms-tank1.png"), plot = p_figS3, width = 13, height = 14, dpi = 600)
+```
+
+Jitter plot
+```{r compar_platform_clust_jitter, message=FALSE, warning=FALSE, fig.width=7., fig.height=5.0, fig.align='center', echo=T, fig.cap="\\label{fig:compar_plat_jitterplot}Jitter plot of the 10 most abundant genera in the platform comparison experiment"}
+# Remove Tetrasphaera - temporary! REMOVE
+#d_amp_clust_tetra <- amp_subset_taxa(d_amp_clust2_rare, tax_vector = c("Tetrasphaera"), remove = TRUE)
+
+# Create an ampvis2 boxplot and output the details to manipulate boxplot
+box1clust <- amp_boxplot(amp_subset_samples(d_amp_both, Tank == "01"),
+            group_by = "Platform",
+            tax_show = 25,
+            tax_add = "Phylum",
+            detailed_output = TRUE)
+
+# Save the data from the detailed output in a new variable - outputs 9 replicate rows for each sample for some reason
+boxdataclust <- box1clust$plot$data %>%
+  .[!duplicated(.), ]
+
+# Create jitter plot
+ggplot(boxdataclust, aes(x=Display, y=Abundance, color = .Group)) +
+  #geom_point(position = position_jitterdodge()) +
+  geom_point(position = position_dodge(width = .5)) +
+  scale_color_colorblind() +
+  guides(col = guide_legend(reverse = TRUE)) +
+  xlab("") +
+  ylab("Read Abundance (%)") +
+  theme_classic() +
+  theme(axis.line = element_line(),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        panel.grid.major = element_line(color = "grey90"),
+        axis.text = element_text(size = 12),
+        legend.text = element_text(size=12),
+        legend.key.size = unit(1.5, "lines")
+        ) +
+  coord_flip() + 
+  scale_y_continuous(limits = c(0, 26), breaks = seq(0, 26, 2)) #+
+#ggsave("map_db_test/plots/platform_jitterplot-lib4.png", dpi = 600, height = 7, width = 9)
+```
+
+OLD WAY - DELETE
+```{r eval = FALSE}
+heat_illu <- amp_heatmap(amp_subset_samples(d_amp_il, Tank == "01"),
+            group_by = c("Date"),
+            #facet_by = "Tank",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 25,
+            #color_vector = c("blue","white", "red3"),
+            plot_values_size = 3, textmap=F) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom", plot.title = element_text(size=14)) + ggtitle("Illumina")
+
+heat_nano <- amp_heatmap(amp_subset_samples(d_amp_nano, Tank == "01"),
+            group_by = c("Date"),
+            #facet_by = "Tank",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 25,
+            #color_vector = c("blue","white", "red3"),
+            plot_values_size = 3, textmap=F) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom", plot.title = element_text(size=14)) + ggtitle("Nanopore")
+
+heatmap_platform = grid.arrange(heat_illu, heat_nano, nrow = 1)
+ggsave(filename = paste0("figures/",format(Sys.Date(), "%Y-%m-%d"),"_heatmap-platforms-tank1.png"), plot = heatmap_platform, width = 18, height = 9, dpi = 600)
+##
+
+nitri_taxa <- c("Nitrospira", "Ca_Brocadia", "Nitrosomonas")
+nitrifier_illu <- amp_subset_taxa(d_amp_il, tax_vector = nitri_taxa, normalise = TRUE)
+nitrifier_nano <- amp_subset_taxa(d_amp_nano, tax_vector = nitri_taxa, normalise = TRUE)
+
+# Tank 1
+#tank1 <- amp_subset_samples(nitrifiers, Tank == "01")
+p1_illu <- amp_timeseries(amp_subset_samples(nitrifier_illu, Tank == "01"), time_variable = "Date", tax_aggregate = "Genus", tax_add = "Phylum", normalise = FALSE) + scale_x_date(breaks = "week") + scale_y_continuous(breaks = seq(0, 24, 2)) + theme(axis.text.x = element_text(angle = 45)) + ggtitle("Nitrifiers in Illumina data, VCS tank 01")
+
+p1_nano <- amp_timeseries(amp_subset_samples(nitrifier_nano, Tank == "01"), time_variable = "Date", tax_aggregate = "Genus", tax_add = "Phylum", normalise = FALSE) + scale_x_date(breaks = "week") + scale_y_continuous(breaks = seq(0, 24, 2)) + theme(axis.text.x = element_text(angle = 45)) + ggtitle("Nitrifiers in Nanopore data, VCS tank 01")
+
+grid.arrange(p1_illu, p1_nano, nrow = 2)
+```
+
+# Nanopore only
+
+#### Statistics
+```{r fig.width = 6, fig.height = 12, dpi=600, fig.align='center', echo=T, message=FALSE, warning=FALSE}
+stats <- d_amp %>%
+  amp_alphadiv(measure = c("observed", "shannon"), rarefy = 20000) %>% 
+  dplyr::select(SeqID, SampleNo, Date, ExtConc, LibConc, MappedReads=RawReads, ObservedOTUs, Shannon) %>%
+  mutate(LibConc = round(LibConc, 1),
+         ExtConc = round(ExtConc, 1),
+         Shannon = round(Shannon, 1)) %>%
+  #arrange(as.numeric(substring(SeqID,10)))
+  arrange(SeqID,10)
+
+tt2 <- ttheme_default(core=list(fg_params=list(hjust=1, 
+                                                          x = 0.95, 
+                                                          fontsize = 4)),
+                      colhead=list(fg_params=list(fontsize = 5)))
+grid.table(stats, rows= NULL, theme = tt2)
+```
+
+Sample 288 has 11800 and should be resequenced
+
+#### PCA
+```{r, fig.height = 6,fig.width = 6, fig.align='center', echo=T, message=FALSE, warning=FALSE}
+pca1 <- amp_ordinate(data = d_amp_s, 
+             type = "PCA", 
+             transform = "hellinger", 
+             sample_label_by = "SampleNo",
+             sample_color_by = "Tank",
+             #sample_shape_by = "Readcount",
+             #sample_trajectory = "Date",
+             #sample_trajectory_group = "Tank",
+             #sample_colorframe = TRUE,
+             sample_label_size = 2) +
+  theme_classic() +
+  theme(legend.position = "bottom")# +
+  #scale_color_discrete(name = "Sample")
+
+#plotly::ggplotly(pca1)
+pca1
+```
+
+PCA with trajectories
+```{r, fig.height = 6,fig.width = 6, fig.align='center', echo=T, message=FALSE, warning=FALSE}
+subsetDateVector <- d_amp_s$metadata$Date[seq(1, length(d_amp_s$metadata$Date), 10)]
+subsetDates <- amp_subset_samples(d_amp_s, Date %in% subsetDateVector)# %>% subset(Date %in% subsetDateVector)
+
+p1 <- amp_ordinate(data = d_amp_s, 
+             type = "PCA", 
+             transform = "hellinger", 
+             sample_label_by = "SampleNo",
+             sample_color_by = "Date",
+             sample_shape_by = "Tank",
+             sample_trajectory = "Date",
+             sample_trajectory_group = "Tank",
+             #sample_colorframe = TRUE,
+             sample_label_size = 2) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+p1 #+ ggrepel::geom_text_repel(data = subsetDates)
+```
+
+#### Heatmaps
+All samples
+```{r, fig.height = 10, fig.width = 15, fig.align='center', echo=T, message=FALSE, warning=FALSE}
+amp_heatmap(d_amp_s,
+            group_by = c("Date"),
+            facet_by = "Tank",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 20,
+            color_vector = c("Blue", "white", "red3"),
+            plot_values_size = 3, textmap=F) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom")
+```
+
+Since mid august
+```{r, fig.height = 10, fig.width = 15, fig.align='center', echo=T, message=FALSE, warning=FALSE}
+amp_heatmap(amp_subset_samples(d_amp_s, Date > "2020-08-15"),
+            group_by = c("Date"),
+            facet_by = "Tank",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 20,
+            color_vector = c("blue","white", "red3"),
+            plot_values_size = 3, textmap=F) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom")
+```
+
+Since mid september
+```{r, fig.height = 10, fig.width = 15, fig.align='center', echo=T, message=FALSE, warning=FALSE}
+amp_heatmap(amp_subset_samples(d_amp_s, Date > "2021-03-01"),
+            group_by = c("Date"),
+            facet_by = "Tank",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 20,
+            color_vector = c("blue","white", "red3"),
+            plot_values_size = 3, textmap=F) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom")
+```
+
+If this is correct there is basically no Brocadia left in the tanks?
+
+#### Hydrocyclone + overflow heatmap
+```{r, fig.height = 10, fig.width = 10, fig.align='center', echo=T, message=FALSE, warning=FALSE}
+amp_heatmap(T1,
+            group_by = c("Date"),
+            facet_by = "samplingSpot",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 20,
+            color_vector = c("blue","white", "red3"),
+            plot_values_size = 3, textmap=F) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom") + ggtitle("Tank 1")
+```
+
+```{r, fig.height = 10, fig.width = 10, fig.align='center', echo=T, message=FALSE, warning=FALSE}
+amp_heatmap(T2,
+            group_by = c("Date"),
+            facet_by = "samplingSpot",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 20,
+            color_vector = c("blue","white", "red3"),
+            plot_values_size = 3, textmap=F) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom") + ggtitle("Tank 2")
+```
+
+
+
+```{r, fig.height = 10, fig.width = 10, fig.align='center', echo=T, message=FALSE, warning=FALSE}
+amp_heatmap(amp_subset_samples(d_amp, samplingSpot == "overflow"),
+            group_by = c("Date"),
+            facet_by = "Tank",
+            tax_aggregate = "Genus",
+            tax_add = "Phylum",
+            plot_colorscale = "sqrt",
+            min_abundance = 0.1,
+            tax_show = 20,
+            color_vector = c("blue","white", "red3"),
+            plot_values_size = 3, textmap=F) +
+  theme(axis.text = element_text(size = 8),
+        legend.position = "bottom") + ggtitle("Overflow in Tank 1 and 2")
+```
+#### Nitrifier timeline
+```{r, fig.height = 10, fig.width = 15, fig.align='center', echo=T, message=FALSE, warning=FALSE}
+#taxcount_midas <- levels(as.factor(MiDAS$tax$Genus)) %>% length()
+nitri_taxa <- c("Nitrospira", "Ca_Brocadia", "Nitrosomonas")
+
+nitrifiers <- amp_subset_taxa(d_amp_s, tax_vector = nitri_taxa, normalise = TRUE)
+
+# Tank 1
+tank1 <- amp_subset_samples(nitrifiers, Tank == "01")
+p1n <- amp_timeseries(tank1, time_variable = "Date", tax_aggregate = "Genus", tax_add = "Phylum", normalise = FALSE)
+p2n <- p1n + scale_x_date(breaks = "week") + scale_y_continuous(breaks = seq(0, 24, 2)) + theme(axis.text.x = element_text(angle = 45)) + ggtitle("Nitrifiers in VCS tank 01")
+
+#p2
+
+# Tank 2
+tank2 <- amp_subset_samples(nitrifiers, Tank == "02")
+p3n <- amp_timeseries(tank2, time_variable = "Date", tax_aggregate = "Genus", tax_add = "Phylum", normalise = FALSE)
+p4n <- p3n + scale_x_date(breaks = "week") + scale_y_continuous(breaks = seq(0, 24, 2)) + theme(axis.text.x = element_text(angle = 45)) + ggtitle("Nitrifiers in VCS tank 02")
+
+#p4
+
+grid.arrange(p2n, p4n, nrow = 2)
+```
+
